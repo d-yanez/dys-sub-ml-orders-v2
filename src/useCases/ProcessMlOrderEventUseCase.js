@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const logger = require('../infrastructure/logger');
+const { sendTelegramMessage } = require('../infrastructure/telegramClient');
 
 class ProcessMlOrderEventUseCase {
   static execute(envelope) {
@@ -31,6 +32,23 @@ class ProcessMlOrderEventUseCase {
       attributes,
       payload
     });
+
+    const resource = payload && payload.resource ? String(payload.resource) : '';
+    const orderId = resource
+      .split('/')
+      .filter(Boolean)
+      .pop() || null;
+
+    if (resource && orderId) {
+      const text = `📦 ML Orders V2 — Evento recibido\n🧾 OrderId: ${orderId}\n🔗 Resource: ${resource}`;
+      sendTelegramMessage(text);
+    } else {
+      logger.error({
+        event: 'telegram_missing_resource',
+        traceId,
+        resource
+      });
+    }
   }
 }
 
