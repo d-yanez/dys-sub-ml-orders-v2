@@ -1,0 +1,39 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: 'Build image'
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - --platform=linux/amd64
+      - -t
+      - "gcr.io/$PROJECT_ID/dys-sub-ml-orders-v2:$SHORT_SHA"
+      - .
+  - id: 'Push image'
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - push
+      - "gcr.io/$PROJECT_ID/dys-sub-ml-orders-v2:$SHORT_SHA"
+  - id: 'Deploy to Cloud Run'
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud run deploy dys-sub-ml-orders-v2 \
+          --image gcr.io/$PROJECT_ID/dys-sub-ml-orders-v2:$SHORT_SHA \
+          --region=us-central1 \
+          --platform=managed \
+          --service-account=sa-dys-sub-ml-orders-v2@${PROJECT_ID}.iam.gserviceaccount.com \
+          --allow-unauthenticated \
+          --port=8080 \
+          --timeout=300s \
+          --memory=256Mi \
+          --cpu=0.5 \
+          --concurrency=1 \
+          --min-instances=0 \
+          --max-instances=1
+
+images:
+  - "gcr.io/$PROJECT_ID/dys-sub-ml-orders-v2:$SHORT_SHA"
