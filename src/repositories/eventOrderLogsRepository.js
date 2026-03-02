@@ -1,6 +1,9 @@
 const { getCollections } = require('../infrastructure/mongoClient');
 
 function resolveSelector({ messageId, traceId, orderId }) {
+  if (orderId) {
+    return { orderId };
+  }
   if (messageId) {
     return { messageId };
   }
@@ -15,28 +18,20 @@ async function registerOrderProcessing({
   packId,
   traceId,
   messageId,
-  idempotencyKey,
-  idempotencySource,
   payload,
   service,
   env
 }) {
   const now = new Date();
   const { eventOrderLogs } = getCollections();
-  const resolvedKey = idempotencyKey || messageId || traceId || orderId;
-  const resolvedSource = idempotencySource || (messageId ? 'messageId' : traceId ? 'traceId' : 'orderId');
-  const selector = { idempotencyKey: resolvedKey };
+  const selector = { orderId };
 
   const result = await eventOrderLogs.updateOne(
     selector,
     {
       $setOnInsert: {
-        idempotencyKey: resolvedKey,
-        idempotencySource: resolvedSource,
         orderId,
         packId: packId || null,
-        traceId,
-        messageId: messageId || null,
         service,
         env,
         status: 'PROCESSING',
@@ -49,6 +44,8 @@ async function registerOrderProcessing({
         createdAt: now
       },
       $set: {
+        traceId,
+        messageId: messageId || null,
         updatedAt: now
       }
     },
@@ -136,8 +133,77 @@ async function updateOrderEventStatus({
   );
 }
 
+async function claimTelegramSend({ orderId, owner, claimMs }) {
+  const now = new Date();
+  const claimUntil = new Date(now.getTime() + claimMs);
+  const { eventOrderLogs } = getCollections();
+
+  const result = await eventOrderLogs.findOneAndUpdate(
+    {
+      orderId,
+      'telegram.sentAt': { $exists: false },
+      $or: [
+        { 'telegram.claimedAt': { $exists: false } },
+        { 'telegram.claimUntil': { $lt: now } },
+        { 'telegram.claimOwner': owner }
+      ]
+    },
+    {
+      $set: {
+        'telegram.claimedAt': now,
+        'telegram.claimUntil': claimUntil,
+        'telegram.claimOwner': owner,
+        updatedAt: now
+      }
+    },
+    { returnDocument: 'after' }
+  );
+
+  return Boolean(result && result.orderId === orderId);
+}
+
+async function markTelegramSent({ orderId, owner }) {
+  const now = new Date();
+  const { eventOrderLogs } = getCollections();
+  await eventOrderLogs.updateOne(
+    {
+      orderId,
+      'telegram.claimOwner': owner
+    },
+    {
+      $set: {
+        'telegram.sent': true,
+        'telegram.sentAt': now,
+        'telegram.sentBy': owner,
+        updatedAt: now
+      }
+    }
+  );
+}
+
+async function clearTelegramClaim({ orderId, owner, error }) {
+  const now = new Date();
+  const { eventOrderLogs } = getCollections();
+  await eventOrderLogs.updateOne(
+    {
+      orderId,
+      'telegram.claimOwner': owner
+    },
+    {
+      $set: {
+        'telegram.claimUntil': now,
+        'telegram.lastError': error ? String(error).slice(0, 200) : null,
+        updatedAt: now
+      }
+    }
+  );
+}
+
 module.exports = {
   registerOrderProcessing,
   appendOrderPhase,
-  updateOrderEventStatus
+  updateOrderEventStatus,
+  claimTelegramSend,
+  markTelegramSent,
+  clearTelegramClaim
 };

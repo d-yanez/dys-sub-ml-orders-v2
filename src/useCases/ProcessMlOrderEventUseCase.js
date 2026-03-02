@@ -5,7 +5,10 @@ const { sendTelegramNotification } = require('../infrastructure/telegramClient')
 const {
   registerOrderProcessing,
   appendOrderPhase,
-  updateOrderEventStatus
+  updateOrderEventStatus,
+  claimTelegramSend,
+  markTelegramSent,
+  clearTelegramClaim
 } = require('../repositories/eventOrderLogsRepository');
 const { acquireLease } = require('../repositories/leaseLock');
 const { upsertOrderDocument, updateOrderEnrichment } = require('../repositories/orderRepository');
@@ -88,16 +91,6 @@ function getFailureStatusFromAck(ackStatus) {
   return ackStatus === 500 ? 'FAILED_TRANSIENT' : 'FAILED_PERMANENT';
 }
 
-function resolveIdempotencyKey({ messageId, traceId, orderId }) {
-  if (messageId) {
-    return { key: String(messageId), source: 'messageId' };
-  }
-  if (traceId) {
-    return { key: String(traceId), source: 'traceId' };
-  }
-  return { key: String(orderId || ''), source: 'orderId' };
-}
-
 class ProcessMlOrderEventUseCase {
   static async execute(envelope) {
     const processStart = Date.now();
@@ -134,6 +127,7 @@ class ProcessMlOrderEventUseCase {
     let finalErrorSummary = null;
     let finalErrorDetails = null;
     let lockLease = null;
+    const telegramClaimOwner = uuidv4();
 
     const recordPhase = async ({ phase, startedAt, attempts = 1, result, errorCode, errorSummary, errorDetails }) => {
       const entry = {
@@ -175,6 +169,37 @@ class ProcessMlOrderEventUseCase {
       }
     };
 
+    const sendTelegramOnce = async ({ html, photoUrl }) => {
+      const claimed = await claimTelegramSend({
+        orderId,
+        owner: telegramClaimOwner,
+        claimMs: env.processingLeaseMs
+      });
+
+      if (!claimed) {
+        log.debug({
+          event: 'telegram_claim_rejected',
+          phase: 'telegram',
+          status: 'SUCCESS'
+        });
+        return false;
+      }
+
+      try {
+        await sendTelegramNotification({
+          html,
+          photoUrl,
+          traceId,
+          orderId
+        });
+        await markTelegramSent({ orderId, owner: telegramClaimOwner });
+        return true;
+      } catch (error) {
+        await clearTelegramClaim({ orderId, owner: telegramClaimOwner, error: error.message });
+        throw error;
+      }
+    };
+
     try {
       const payloadRaw = Buffer.from(message.data || '', 'base64').toString();
       payload = payloadRaw ? JSON.parse(payloadRaw) : null;
@@ -194,12 +219,33 @@ class ProcessMlOrderEventUseCase {
     orderId = extraction.orderId;
     updateLogContext(ctx, { orderId });
 
-    const idempotency = resolveIdempotencyKey({ messageId, traceId, orderId });
     const lockOwner = uuidv4();
+
+    log.info({
+      event: 'phase_received_event',
+      phase: 'ingest',
+      status: 'SUCCESS',
+      subscription: env.subscriptionName,
+      publishTime: message.publishTime || null,
+      attributes,
+      payload
+    });
+
+    if (!orderId) {
+      log.error({
+        event: 'phase_invalid_resource',
+        phase: 'ingest',
+        status: 'ERROR',
+        errorCode: ERROR_CODES.INVALID_RESOURCE,
+        errorSummary: 'Resource does not include orderId',
+        errorDetails: extraction.resource
+      });
+      return { ackStatus: 204, traceId, orderId: null };
+    }
 
     try {
       lockLease = await acquireLease({
-        key: idempotency.key,
+        key: String(orderId),
         owner: lockOwner,
         leaseMs: env.processingLeaseMs
       });
@@ -225,8 +271,8 @@ class ProcessMlOrderEventUseCase {
         event: 'lock_busy',
         phase: 'idempotency',
         status: 'SUCCESS',
-        idempotencyKey: idempotency.key,
-        idempotencySource: idempotency.source,
+        idempotencyKey: String(orderId),
+        idempotencySource: 'orderId',
         lockOwner,
         lockLeaseUntil: lockLease.lock && lockLease.lock.leaseUntil ? lockLease.lock.leaseUntil : null
       });
@@ -237,33 +283,11 @@ class ProcessMlOrderEventUseCase {
       event: 'lock_ok',
       phase: 'idempotency',
       status: 'SUCCESS',
-      idempotencyKey: idempotency.key,
-      idempotencySource: idempotency.source,
+      idempotencyKey: String(orderId),
+      idempotencySource: 'orderId',
       lockOwner,
       lockLeaseUntil: lockLease.lock && lockLease.lock.leaseUntil ? lockLease.lock.leaseUntil : null
     });
-
-    log.info({
-      event: 'phase_received_event',
-      phase: 'ingest',
-      status: 'SUCCESS',
-      subscription: env.subscriptionName,
-      publishTime: message.publishTime || null,
-      attributes,
-      payload
-    });
-
-    if (!orderId) {
-      log.error({
-        event: 'phase_invalid_resource',
-        phase: 'ingest',
-        status: 'ERROR',
-        errorCode: ERROR_CODES.INVALID_RESOURCE,
-        errorSummary: 'Resource does not include orderId',
-        errorDetails: extraction.resource
-      });
-      return { ackStatus: 204, traceId, orderId: null };
-    }
 
     try {
       const idempotencyStartedAt = Date.now();
@@ -271,8 +295,6 @@ class ProcessMlOrderEventUseCase {
         orderId,
         traceId,
         messageId,
-        idempotencyKey: idempotency.key,
-        idempotencySource: idempotency.source,
         payload,
         service: env.serviceName,
         env: env.nodeEnv
@@ -576,7 +598,7 @@ class ProcessMlOrderEventUseCase {
       });
 
       try {
-        await sendTelegramNotification({
+        await sendTelegramOnce({
           html: buildErrorTelegramHtml({
             orderId,
             traceId,
@@ -584,9 +606,7 @@ class ProcessMlOrderEventUseCase {
             errorCode: finalErrorCode,
             message: finalErrorSummary
           }),
-          photoUrl: null,
-          traceId,
-          orderId
+          photoUrl: null
         });
       } catch (telegramError) {
         log.error({
@@ -665,17 +685,17 @@ class ProcessMlOrderEventUseCase {
     const itemPhotoUrl = resolveItemPhotoUrl(mlItemResponse);
 
     try {
-      await sendTelegramNotification({
+      const sent = await sendTelegramOnce({
         html,
-        photoUrl: itemPhotoUrl,
-        traceId,
-        orderId
+        photoUrl: itemPhotoUrl
       });
-      log.debug({
-        event: 'phase_telegram_done',
-        phase: 'telegram',
-        status: 'SUCCESS'
-      });
+      if (sent) {
+        log.debug({
+          event: 'phase_telegram_done',
+          phase: 'telegram',
+          status: 'SUCCESS'
+        });
+      }
     } catch (error) {
       warning = warning || `Telegram failed: ${toSummaryMessage(error)}`;
       finalErrorCode = ERROR_CODES.TELEGRAM_FAILED;

@@ -29,22 +29,18 @@ async function ensureIndexes() {
   const ttlSeconds = Math.max(env.eventLogTtlDays, 1) * 24 * 60 * 60;
 
   await dropIndexIfExists(eventOrderLogs, 'ux_eventOrderLogs_orderId');
+  await dropIndexIfExists(eventOrderLogs, 'ux_eventOrderLogs_idempotencyKey');
+  await dropIndexIfExists(eventOrderLogs, 'ux_eventOrderLogs_messageId');
 
   await eventOrderLogs.createIndexes([
     {
-      key: { idempotencyKey: 1 },
+      key: { orderId: 1 },
       unique: true,
-      name: 'ux_eventOrderLogs_idempotencyKey',
-      partialFilterExpression: { idempotencyKey: { $type: 'string' } }
+      name: 'ux_eventOrderLogs_orderId',
+      partialFilterExpression: { orderId: { $type: 'string' } }
     },
     { key: { traceId: 1 }, name: 'ix_eventOrderLogs_traceId' },
-    { key: { orderId: 1 }, name: 'ix_eventOrderLogs_orderId' },
-    {
-      key: { messageId: 1 },
-      unique: true,
-      name: 'ux_eventOrderLogs_messageId',
-      partialFilterExpression: { messageId: { $type: 'string' } }
-    },
+    { key: { messageId: 1 }, name: 'ix_eventOrderLogs_messageId' },
     { key: { createdAt: 1 }, expireAfterSeconds: ttlSeconds, name: 'ttl_eventOrderLogs_createdAt' }
   ]);
 

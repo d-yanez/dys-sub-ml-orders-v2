@@ -46,23 +46,6 @@ function validateTelegramConfig(log) {
   return true;
 }
 
-function buildTraceInlineKeyboard(traceId) {
-  if (!traceId) {
-    return undefined;
-  }
-
-  return {
-    inline_keyboard: [
-      [
-        {
-          text: 'Copiar traceId',
-          switch_inline_query_current_chat: String(traceId)
-        }
-      ]
-    ]
-  };
-}
-
 async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
   const ctx = createLogContext({
     traceId: traceId || null,
@@ -76,16 +59,13 @@ async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
     return false;
   }
 
-  const replyMarkup = buildTraceInlineKeyboard(traceId);
-
   if (photoUrl) {
     try {
       await sendRequest('sendPhoto', {
         chat_id: env.telegramChatId,
         photo: photoUrl,
         caption: html,
-        parse_mode: 'HTML',
-        reply_markup: replyMarkup
+        parse_mode: 'HTML'
       });
       log.info({
         event: 'telegram_send_photo_done',
@@ -111,8 +91,7 @@ async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
     chat_id: env.telegramChatId,
     text: html,
     parse_mode: 'HTML',
-    disable_web_page_preview: false,
-    reply_markup: replyMarkup
+    disable_web_page_preview: false
   });
 
   log.info({
