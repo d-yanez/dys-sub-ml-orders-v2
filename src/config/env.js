@@ -6,6 +6,8 @@ function parseIntOrDefault(value, defaultValue) {
 const env = {
   port: parseIntOrDefault(process.env.PORT, 8080),
   logLevel: process.env.LOG_LEVEL || 'info',
+  nodeEnv: process.env.NODE_ENV || 'dev',
+  serviceName: process.env.SERVICE_NAME || 'dys-sub-ml-orders-v2',
   subscriptionName: process.env.SUBSCRIPTION_NAME || null,
   mongodbUri: process.env.MONGODB_URI || '',
   mongodbDbName: process.env.MONGODB_DB_NAME || 'mlDB',
@@ -24,9 +26,16 @@ const env = {
   retryMaxAttemptsMlOrder: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_ML_ORDER, 3),
   retryMaxAttemptsMlItem: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_ML_ITEM, 3),
   retryMaxAttemptsStock: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_STOCK, 2),
+  processTotalBudgetMs: parseIntOrDefault(process.env.PROCESS_TOTAL_BUDGET_MS, 10000),
+  processingLeaseMs: parseIntOrDefault(process.env.PROCESSING_LEASE_MS, 30000),
+  processingLockTtlSeconds: parseIntOrDefault(process.env.PROCESSING_LOCK_TTL_SECONDS, 600),
+  stockCircuitFailureThreshold: parseIntOrDefault(process.env.STOCK_CIRCUIT_FAILURE_THRESHOLD, 5),
+  stockCircuitWindowMs: parseIntOrDefault(process.env.STOCK_CIRCUIT_WINDOW_MS, 30000),
+  stockCircuitOpenDurationMs: parseIntOrDefault(process.env.STOCK_CIRCUIT_OPEN_DURATION_MS, 25000),
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
-  telegramCaptionLimit: parseIntOrDefault(process.env.TELEGRAM_CAPTION_LIMIT, 1024)
+  telegramCaptionLimit: parseIntOrDefault(process.env.TELEGRAM_CAPTION_LIMIT, 1024),
+  telegramTimeoutMs: parseIntOrDefault(process.env.TELEGRAM_TIMEOUT_MS, 5000)
 };
 
 module.exports = env;

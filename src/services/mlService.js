@@ -1,7 +1,7 @@
 const env = require('../config/env');
 const { requestJsonWithRetry } = require('../utils/http');
 
-async function getMlOrder(orderId) {
+async function getMlOrder(orderId, resilienceCtx = {}) {
   const url = `${env.mlAuthBaseUrl}/ml/7617772409564070/orders/${encodeURIComponent(orderId)}`;
 
   return requestJsonWithRetry({
@@ -11,11 +11,13 @@ async function getMlOrder(orderId) {
       'api-key': env.apiKeyMl
     },
     timeoutMs: env.httpTimeoutMsMlOrder,
-    maxAttempts: env.retryMaxAttemptsMlOrder
+    maxAttempts: env.retryMaxAttemptsMlOrder,
+    budgetStartedAt: resilienceCtx.startedAt,
+    totalBudgetMs: resilienceCtx.totalBudgetMs
   });
 }
 
-async function getMlItem(itemId) {
+async function getMlItem(itemId, resilienceCtx = {}) {
   const url = `${env.mlAuthBaseUrl}/ml/7617772409564070/items/${encodeURIComponent(itemId)}`;
 
   return requestJsonWithRetry({
@@ -25,7 +27,9 @@ async function getMlItem(itemId) {
       'api-key': env.apiKeyMl
     },
     timeoutMs: env.httpTimeoutMsMlItem,
-    maxAttempts: env.retryMaxAttemptsMlItem
+    maxAttempts: env.retryMaxAttemptsMlItem,
+    budgetStartedAt: resilienceCtx.startedAt,
+    totalBudgetMs: resilienceCtx.totalBudgetMs
   });
 }
 

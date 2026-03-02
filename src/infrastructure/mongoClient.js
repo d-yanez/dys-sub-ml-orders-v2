@@ -1,6 +1,6 @@
 const { MongoClient } = require('mongodb');
-const logger = require('./logger');
 const env = require('../config/env');
+const { createLogContext, createLogger } = require('./logContext');
 
 let client = null;
 let db = null;
@@ -8,17 +8,53 @@ let db = null;
 function getCollections() {
   return {
     eventOrderLogs: db.collection('eventOrderLogs'),
+    processingLocks: db.collection('processingLocks'),
     order: db.collection('order')
   };
 }
 
+async function dropIndexIfExists(collection, indexName) {
+  try {
+    await collection.dropIndex(indexName);
+  } catch (error) {
+    if (error && (error.codeName === 'IndexNotFound' || String(error.message).includes('index not found'))) {
+      return;
+    }
+    throw error;
+  }
+}
+
 async function ensureIndexes() {
-  const { eventOrderLogs, order } = getCollections();
+  const { eventOrderLogs, processingLocks, order } = getCollections();
   const ttlSeconds = Math.max(env.eventLogTtlDays, 1) * 24 * 60 * 60;
 
+  await dropIndexIfExists(eventOrderLogs, 'ux_eventOrderLogs_orderId');
+
   await eventOrderLogs.createIndexes([
-    { key: { orderId: 1 }, unique: true, name: 'ux_eventOrderLogs_orderId' },
+    {
+      key: { idempotencyKey: 1 },
+      unique: true,
+      name: 'ux_eventOrderLogs_idempotencyKey',
+      partialFilterExpression: { idempotencyKey: { $type: 'string' } }
+    },
+    { key: { traceId: 1 }, name: 'ix_eventOrderLogs_traceId' },
+    { key: { orderId: 1 }, name: 'ix_eventOrderLogs_orderId' },
+    {
+      key: { messageId: 1 },
+      unique: true,
+      name: 'ux_eventOrderLogs_messageId',
+      partialFilterExpression: { messageId: { $type: 'string' } }
+    },
     { key: { createdAt: 1 }, expireAfterSeconds: ttlSeconds, name: 'ttl_eventOrderLogs_createdAt' }
+  ]);
+
+  await processingLocks.createIndexes([
+    { key: { key: 1 }, unique: true, name: 'ux_processingLocks_key' },
+    {
+      key: { createdAt: 1 },
+      expireAfterSeconds: Math.max(env.processingLockTtlSeconds, 60),
+      name: 'ttl_processingLocks_createdAt'
+    }
   ]);
 
   await order.createIndexes([
@@ -31,6 +67,13 @@ async function ensureIndexes() {
 }
 
 async function connectMongo() {
+  const log = createLogger(
+    createLogContext({
+      service: env.serviceName,
+      env: env.nodeEnv
+    })
+  );
+
   if (db) {
     return db;
   }
@@ -48,8 +91,10 @@ async function connectMongo() {
   });
 
   client.on('serverDescriptionChanged', (event) => {
-    logger.info({
+    log.info({
       event: 'mongo_server_description_changed',
+      phase: 'persist_order',
+      status: 'SUCCESS',
       address: event.address,
       previousType: event.previousDescription ? event.previousDescription.type : null,
       newType: event.newDescription ? event.newDescription.type : null
@@ -61,8 +106,10 @@ async function connectMongo() {
 
   await ensureIndexes();
 
-  logger.info({
+  log.info({
     event: 'mongo_connected',
+    phase: 'persist_order',
+    status: 'SUCCESS',
     dbName: env.mongodbDbName,
     ttlDays: env.eventLogTtlDays
   });

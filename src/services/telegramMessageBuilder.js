@@ -95,10 +95,16 @@ function buildTelegramHtml(payload, compact = false) {
     lines.push('⚠️ Ubicacion sugerida: <i>sin stock/stock no encontrado</i>');
   }
 
+  if (payload.stockStatusText) {
+    lines.push(`<b>Estado stock:</b> ${escapeHtml(payload.stockStatusText)}`);
+  }
+
   lines.push(buildStockTable(payload.stockRows, compact));
   lines.push(
     `<b>Tiempos:</b> ML Order ${formatCode(`${payload.timings.elapsed_ms_ml_order || 0} ms`, '0 ms')} | ML Item ${formatCode(`${payload.timings.elapsed_ms_ml_item || 0} ms`, '0 ms')} | Stock ${formatCode(`${payload.timings.elapsed_ms_stock || 0} ms`, '0 ms')} | <b>Total:</b> ${escapeHtml(payload.totalMs || payload.timings.elapsed_ms_total || 0)} ms`
   );
+  lines.push(`<b>TraceId:</b> ${formatCode(payload.traceId, '-')}`);
+  lines.push(`🔎 Buscar en GCP: <code>traceId=${escapeHtml(payload.traceId || '-')}</code>`);
   lines.push(permalinkLine);
 
   let html = lines.join('\n');
@@ -108,27 +114,26 @@ function buildTelegramHtml(payload, compact = false) {
   }
 
   if (html.length > env.telegramCaptionLimit && compact) {
-    const suggestedLocation = pickSuggestedLocation(payload.stockRows);
-    const mandatoryLines = [
+    const compactLines = [
       '<b>🛒 Orden ML</b>',
       `<b>OrderId:</b> ${formatCode(payload.orderId, '-')}`,
       `<b>SKU:</b> ${formatCode(payload.sku, '-')}`,
       `<b>Cantidad:</b> <b>${escapeHtml(payload.quantity || 0)}</b>`,
-      suggestedLocation
-        ? `✅ <b>Ubicacion sugerida:</b> <b>${escapeHtml(suggestedLocation.location)}</b> (${escapeHtml(suggestedLocation.stock)})`
-        : '⚠️ <b>Ubicacion sugerida:</b> <i>sin stock/stock no encontrado</i>'
+      `<b>TraceId:</b> ${formatCode(payload.traceId, '-')}`
     ];
-    html = `${mandatoryLines.join('\n')}\n<i>Mensaje compactado por limite de Telegram</i>`;
+    html = `${compactLines.join('\n')}\n<i>Mensaje compactado por limite de Telegram</i>`;
   }
 
   return html;
 }
 
-function buildErrorTelegramHtml({ orderId, stage, message }) {
+function buildErrorTelegramHtml({ orderId, traceId, stage, errorCode, message }) {
   return [
     '<b>⚠️ Error procesamiento ML</b>',
-    `OrderId: ${formatCode(orderId, '-')}`,
-    `Etapa: <b>${escapeHtml(stage || 'UNKNOWN')}</b>`,
+    `<b>OrderId:</b> ${formatCode(orderId, '-')}`,
+    `<b>TraceId:</b> ${formatCode(traceId, '-')}`,
+    `<b>Etapa:</b> <b>${escapeHtml(stage || 'UNKNOWN')}</b>`,
+    `<b>ErrorCode:</b> ${formatCode(errorCode, 'UNKNOWN_ERROR')}`,
     `Detalle: ${escapeHtml((message || 'Error desconocido').slice(0, 180))}`
   ].join('\n');
 }

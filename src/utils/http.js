@@ -24,6 +24,19 @@ function parseRetryAfterToMs(retryAfterHeader) {
   return Math.max(retryDate.getTime() - Date.now(), 0);
 }
 
+function getRemainingBudgetMs({ budgetStartedAt, totalBudgetMs }) {
+  if (!budgetStartedAt || !totalBudgetMs) {
+    return null;
+  }
+  return totalBudgetMs - (Date.now() - budgetStartedAt);
+}
+
+function shouldRetryNetworkError(error) {
+  const retriableNetworkCodes = new Set(['ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'ECONNREFUSED']);
+  const code = error && error.code ? String(error.code) : '';
+  return retriableNetworkCodes.has(code) || !error.statusCode;
+}
+
 async function requestJsonWithRetry({
   url,
   method = 'GET',
@@ -31,7 +44,9 @@ async function requestJsonWithRetry({
   body,
   timeoutMs,
   maxAttempts,
-  retryBaseMs = 200
+  retryBaseMs = 200,
+  budgetStartedAt,
+  totalBudgetMs
 }) {
   let attempt = 0;
   let lastError = null;
@@ -39,8 +54,22 @@ async function requestJsonWithRetry({
 
   while (attempt < maxAttempts) {
     attempt += 1;
+
+    const remainingBudgetMs = getRemainingBudgetMs({ budgetStartedAt, totalBudgetMs });
+    if (remainingBudgetMs !== null && remainingBudgetMs <= 50) {
+      const budgetError = new Error('Process total budget exhausted before external request');
+      budgetError.isTimeout = true;
+      budgetError.retryable = true;
+      budgetError.attempts = attempt - 1;
+      budgetError.elapsedMs = Date.now() - startedAt;
+      throw budgetError;
+    }
+
+    const effectiveTimeoutMs =
+      remainingBudgetMs !== null ? Math.max(100, Math.min(timeoutMs, remainingBudgetMs - 50)) : timeoutMs;
+
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const timeoutId = setTimeout(() => controller.abort(), effectiveTimeoutMs);
 
     try {
       const response = await fetch(url, {
@@ -60,6 +89,15 @@ async function requestJsonWithRetry({
         if (attempt < maxAttempts && isRetryableStatus(response.status)) {
           const retryDelayMs =
             error.retryAfterMs || retryBaseMs * 2 ** (attempt - 1) + Math.floor(Math.random() * 100);
+
+          const remainingBeforeDelay = getRemainingBudgetMs({ budgetStartedAt, totalBudgetMs });
+          if (remainingBeforeDelay !== null && remainingBeforeDelay <= retryDelayMs + 50) {
+            error.attempts = attempt;
+            error.elapsedMs = Date.now() - startedAt;
+            error.retryable = true;
+            throw error;
+          }
+
           await sleep(retryDelayMs);
           continue;
         }
@@ -76,17 +114,34 @@ async function requestJsonWithRetry({
     } catch (error) {
       lastError = error;
       const isAbort = error && error.name === 'AbortError';
-      const isNetworkError = !error.statusCode;
+      const isNetworkError = shouldRetryNetworkError(error);
       const retryable = isAbort || isNetworkError || isRetryableStatus(error.statusCode);
+
+      if (isAbort) {
+        error.isTimeout = true;
+      }
+      if (isNetworkError) {
+        error.isNetworkError = true;
+      }
 
       if (attempt < maxAttempts && retryable) {
         const retryDelayMs = retryBaseMs * 2 ** (attempt - 1) + Math.floor(Math.random() * 100);
+        const remainingBeforeDelay = getRemainingBudgetMs({ budgetStartedAt, totalBudgetMs });
+
+        if (remainingBeforeDelay !== null && remainingBeforeDelay <= retryDelayMs + 50) {
+          error.attempts = attempt;
+          error.elapsedMs = Date.now() - startedAt;
+          error.retryable = true;
+          throw error;
+        }
+
         await sleep(retryDelayMs);
         continue;
       }
 
       error.attempts = attempt;
       error.elapsedMs = Date.now() - startedAt;
+      error.retryable = retryable;
       throw error;
     } finally {
       clearTimeout(timeoutId);
@@ -102,5 +157,6 @@ async function requestJsonWithRetry({
 
 module.exports = {
   requestJsonWithRetry,
-  isRetryableStatus
+  isRetryableStatus,
+  getRemainingBudgetMs
 };

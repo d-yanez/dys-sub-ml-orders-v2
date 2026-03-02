@@ -1,9 +1,9 @@
-const logger = require('./logger');
 const env = require('../config/env');
+const { createLogContext, createLogger } = require('./logContext');
 
 async function sendRequest(endpoint, body) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const timeoutId = setTimeout(() => controller.abort(), env.telegramTimeoutMs);
 
   try {
     const response = await fetch(`https://api.telegram.org/bot${env.telegramBotToken}/${endpoint}`, {
@@ -20,15 +20,24 @@ async function sendRequest(endpoint, body) {
       error.responseText = bodyText;
       throw error;
     }
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      error.isTimeout = true;
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-function validateTelegramConfig() {
+function validateTelegramConfig(log) {
   if (!env.telegramBotToken || !env.telegramChatId) {
-    logger.error({
+    log.error({
       event: 'telegram_missing_config',
+      phase: 'telegram',
+      status: 'ERROR',
+      errorCode: 'TELEGRAM_FAILED',
+      errorSummary: 'Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID',
       hasToken: Boolean(env.telegramBotToken),
       hasChatId: Boolean(env.telegramChatId)
     });
@@ -37,10 +46,37 @@ function validateTelegramConfig() {
   return true;
 }
 
+function buildTraceInlineKeyboard(traceId) {
+  if (!traceId) {
+    return undefined;
+  }
+
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: 'Copiar traceId',
+          switch_inline_query_current_chat: String(traceId)
+        }
+      ]
+    ]
+  };
+}
+
 async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
-  if (!validateTelegramConfig()) {
+  const ctx = createLogContext({
+    traceId: traceId || null,
+    orderId: orderId || null,
+    service: env.serviceName,
+    env: env.nodeEnv
+  });
+  const log = createLogger(ctx);
+
+  if (!validateTelegramConfig(log)) {
     return false;
   }
+
+  const replyMarkup = buildTraceInlineKeyboard(traceId);
 
   if (photoUrl) {
     try {
@@ -48,21 +84,24 @@ async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
         chat_id: env.telegramChatId,
         photo: photoUrl,
         caption: html,
-        parse_mode: 'HTML'
+        parse_mode: 'HTML',
+        reply_markup: replyMarkup
       });
-      logger.info({
+      log.info({
         event: 'telegram_send_photo_done',
-        traceId,
-        orderId
+        phase: 'telegram',
+        status: 'SUCCESS'
       });
       return true;
     } catch (error) {
-      logger.error({
+      log.error({
         event: 'telegram_send_photo_failed',
-        traceId,
-        orderId,
+        phase: 'telegram',
+        status: 'ERROR',
+        errorCode: 'TELEGRAM_FAILED',
+        errorSummary: 'Telegram sendPhoto failed',
+        errorDetails: error.message,
         statusCode: error.statusCode || null,
-        error: error.message,
         responseText: error.responseText || null
       });
     }
@@ -72,13 +111,14 @@ async function sendTelegramNotification({ html, photoUrl, traceId, orderId }) {
     chat_id: env.telegramChatId,
     text: html,
     parse_mode: 'HTML',
-    disable_web_page_preview: false
+    disable_web_page_preview: false,
+    reply_markup: replyMarkup
   });
 
-  logger.info({
+  log.info({
     event: 'telegram_send_message_done',
-    traceId,
-    orderId
+    phase: 'telegram',
+    status: 'SUCCESS'
   });
 
   return true;

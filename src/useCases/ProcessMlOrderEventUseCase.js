@@ -1,12 +1,19 @@
 const { v4: uuidv4 } = require('uuid');
-const logger = require('../infrastructure/logger');
+const env = require('../config/env');
+const { createLogContext, updateLogContext, createLogger } = require('../infrastructure/logContext');
 const { sendTelegramNotification } = require('../infrastructure/telegramClient');
-const { registerOrderProcessing, updateOrderEventStatus } = require('../repositories/eventOrderLogsRepository');
+const {
+  registerOrderProcessing,
+  appendOrderPhase,
+  updateOrderEventStatus
+} = require('../repositories/eventOrderLogsRepository');
+const { acquireLease } = require('../repositories/leaseLock');
 const { upsertOrderDocument, updateOrderEnrichment } = require('../repositories/orderRepository');
 const { getMlOrder, getMlItem } = require('../services/mlService');
-const { getStockBySku } = require('../services/stockService');
+const { getStockBySku, getStockCircuitSnapshot } = require('../services/stockService');
 const { buildTelegramHtml, buildErrorTelegramHtml } = require('../services/telegramMessageBuilder');
 const ProcessingError = require('../utils/processingError');
+const { ERROR_CODES, classifyDependencyError } = require('../utils/errorCatalog');
 
 function extractOrderIdFromResource(payload) {
   const resource = payload && payload.resource ? String(payload.resource) : '';
@@ -22,25 +29,6 @@ function stripMlcPrefix(idValue) {
     return null;
   }
   return String(idValue).replace(/^MLC/i, '');
-}
-
-function classifyMlError(error, stage) {
-  const status = Number(error.statusCode || 0);
-  const retryable = status === 429 || status >= 500 || !status || error.name === 'AbortError';
-
-  if (retryable) {
-    return new ProcessingError(`Transitory failure at ${stage}`, {
-      stage,
-      ackStatus: 500,
-      summary: `${stage} transitory error: ${error.message}`
-    });
-  }
-
-  return new ProcessingError(`Permanent failure at ${stage}`, {
-    stage,
-    ackStatus: 204,
-    summary: `${stage} permanent error: ${error.message}`
-  });
 }
 
 function mapOrderDoc(mlOrder) {
@@ -96,12 +84,27 @@ function resolveItemPhotoUrl(mlItemResponse) {
   return securePictureUrl || mlItemResponse.thumbnail || null;
 }
 
+function getFailureStatusFromAck(ackStatus) {
+  return ackStatus === 500 ? 'FAILED_TRANSIENT' : 'FAILED_PERMANENT';
+}
+
+function resolveIdempotencyKey({ messageId, traceId, orderId }) {
+  if (messageId) {
+    return { key: String(messageId), source: 'messageId' };
+  }
+  if (traceId) {
+    return { key: String(traceId), source: 'traceId' };
+  }
+  return { key: String(orderId || ''), source: 'orderId' };
+}
+
 class ProcessMlOrderEventUseCase {
   static async execute(envelope) {
     const processStart = Date.now();
     const message = envelope.message || {};
     const attributes = message.attributes || {};
     const traceId = attributes.traceId || uuidv4();
+    const messageId = message.messageId || null;
     const timings = {
       elapsed_ms_ml_order: 0,
       elapsed_ms_ml_item: 0,
@@ -109,74 +112,212 @@ class ProcessMlOrderEventUseCase {
       elapsed_ms_total: 0
     };
 
+    const ctx = createLogContext({
+      traceId,
+      messageId,
+      startedAt: processStart,
+      service: env.serviceName,
+      env: env.nodeEnv
+    });
+    const log = createLogger(ctx);
+    const resilienceCtx = {
+      startedAt: processStart,
+      totalBudgetMs: env.processTotalBudgetMs
+    };
+
+    const phases = [];
     let payload = null;
     let orderId = null;
+    let runSelector = null;
+    let warning = null;
+    let finalErrorCode = null;
+    let finalErrorSummary = null;
+    let finalErrorDetails = null;
+    let lockLease = null;
+
+    const recordPhase = async ({ phase, startedAt, attempts = 1, result, errorCode, errorSummary, errorDetails }) => {
+      const entry = {
+        phase,
+        elapsedMs: Date.now() - startedAt,
+        attempts,
+        result,
+        errorCode: errorCode || null,
+        errorSummary: errorSummary || null,
+        errorDetails: errorDetails || null,
+        at: new Date()
+      };
+      phases.push(entry);
+
+      if (!runSelector) {
+        return;
+      }
+
+      try {
+        await appendOrderPhase({
+          selector: runSelector,
+          phase: entry.phase,
+          elapsedMs: entry.elapsedMs,
+          attempts: entry.attempts,
+          result: entry.result,
+          errorCode: entry.errorCode,
+          errorSummary: entry.errorSummary,
+          errorDetails: entry.errorDetails
+        });
+      } catch (phasePersistError) {
+        log.error({
+          event: 'phase_event_log_update_failed',
+          phase: 'persist_order',
+          status: 'ERROR',
+          errorCode: ERROR_CODES.MONGO_WRITE_FAILED,
+          errorSummary: 'Failed to append phase in eventOrderLogs',
+          errorDetails: phasePersistError.message
+        });
+      }
+    };
 
     try {
       const payloadRaw = Buffer.from(message.data || '', 'base64').toString();
       payload = payloadRaw ? JSON.parse(payloadRaw) : null;
     } catch (err) {
-      logger.error({
-        event: 'pubsub_message_parse_error',
-        error: err.message,
-        traceId,
-        messageId: message.messageId || null
+      log.error({
+        event: 'phase_payload_parse_failed',
+        phase: 'ingest',
+        status: 'ERROR',
+        errorCode: ERROR_CODES.INVALID_PAYLOAD,
+        errorSummary: 'Invalid Pub/Sub payload',
+        errorDetails: err.message
       });
-      return { ackStatus: 204, traceId };
+      return { ackStatus: 204, traceId, orderId: null };
     }
 
     const extraction = extractOrderIdFromResource(payload);
     orderId = extraction.orderId;
+    updateLogContext(ctx, { orderId });
 
-    logger.info({
+    const idempotency = resolveIdempotencyKey({ messageId, traceId, orderId });
+    const lockOwner = uuidv4();
+
+    try {
+      lockLease = await acquireLease({
+        key: idempotency.key,
+        owner: lockOwner,
+        leaseMs: env.processingLeaseMs
+      });
+    } catch (lockError) {
+      const classified = classifyDependencyError({
+        dependency: 'mongo',
+        error: lockError,
+        fallbackSummary: 'Lease acquisition failed'
+      });
+      log.error({
+        event: 'lock_error',
+        phase: 'idempotency',
+        status: 'ERROR',
+        errorCode: classified.errorCode,
+        errorSummary: classified.errorSummary,
+        errorDetails: classified.errorDetails
+      });
+      return { ackStatus: 500, traceId, orderId };
+    }
+
+    if (!lockLease.acquired) {
+      log.debug({
+        event: 'lock_busy',
+        phase: 'idempotency',
+        status: 'SUCCESS',
+        idempotencyKey: idempotency.key,
+        idempotencySource: idempotency.source,
+        lockOwner,
+        lockLeaseUntil: lockLease.lock && lockLease.lock.leaseUntil ? lockLease.lock.leaseUntil : null
+      });
+      return { ackStatus: 204, traceId, orderId, duplicate: true };
+    }
+
+    log.debug({
+      event: 'lock_ok',
+      phase: 'idempotency',
+      status: 'SUCCESS',
+      idempotencyKey: idempotency.key,
+      idempotencySource: idempotency.source,
+      lockOwner,
+      lockLeaseUntil: lockLease.lock && lockLease.lock.leaseUntil ? lockLease.lock.leaseUntil : null
+    });
+
+    log.info({
       event: 'phase_received_event',
       phase: 'ingest',
-      subscription: process.env.SUBSCRIPTION_NAME || null,
-      messageId: message.messageId || null,
+      status: 'SUCCESS',
+      subscription: env.subscriptionName,
       publishTime: message.publishTime || null,
-      traceId,
       attributes,
-      payload,
-      orderId
+      payload
     });
 
     if (!orderId) {
-      logger.error({
+      log.error({
         event: 'phase_invalid_resource',
         phase: 'ingest',
-        traceId,
-        messageId: message.messageId || null,
-        resource: extraction.resource
+        status: 'ERROR',
+        errorCode: ERROR_CODES.INVALID_RESOURCE,
+        errorSummary: 'Resource does not include orderId',
+        errorDetails: extraction.resource
       });
-      return { ackStatus: 204, traceId };
+      return { ackStatus: 204, traceId, orderId: null };
     }
 
     try {
+      const idempotencyStartedAt = Date.now();
       const idempotencyResult = await registerOrderProcessing({
         orderId,
         traceId,
-        messageId: message.messageId || null,
-        payload
+        messageId,
+        idempotencyKey: idempotency.key,
+        idempotencySource: idempotency.source,
+        payload,
+        service: env.serviceName,
+        env: env.nodeEnv
       });
+      runSelector = idempotencyResult.selector;
 
-      logger.info({
-        event: 'phase_idempotency_done',
+      await recordPhase({
         phase: 'idempotency',
-        traceId,
-        orderId,
-        inserted: idempotencyResult.inserted
+        startedAt: idempotencyStartedAt,
+        result: idempotencyResult.inserted ? 'SUCCESS' : 'DUPLICATE'
       });
 
       if (!idempotencyResult.inserted) {
+        log.debug({
+          event: 'phase_idempotency_duplicate',
+          phase: 'idempotency',
+          status: 'SUCCESS'
+        });
+
         return { ackStatus: 204, traceId, orderId, duplicate: true };
       }
+
+      log.debug({
+        event: 'phase_idempotency_done',
+        phase: 'idempotency',
+        status: 'SUCCESS'
+      });
     } catch (error) {
-      logger.error({
+      const classified = classifyDependencyError({ dependency: 'mongo', error, fallbackSummary: 'Idempotency failed' });
+      await recordPhase({
+        phase: 'idempotency',
+        startedAt: processStart,
+        result: 'FAILED_TRANSIENT',
+        errorCode: classified.errorCode,
+        errorSummary: classified.errorSummary,
+        errorDetails: classified.errorDetails
+      });
+
+      log.error({
         event: 'phase_idempotency_failed',
         phase: 'idempotency',
-        traceId,
-        orderId,
-        error: error.message
+        status: 'ERROR',
+        errorCode: classified.errorCode,
+        errorSummary: classified.errorSummary,
+        errorDetails: classified.errorDetails
       });
 
       return { ackStatus: 500, traceId, orderId };
@@ -185,41 +326,51 @@ class ProcessMlOrderEventUseCase {
     let mappedOrder = null;
     let mlItemResponse = null;
     let stockRows = [];
-    let warning = null;
+    let stockStatusText = null;
 
     try {
-      const mlOrderResponse = await getMlOrder(orderId);
+      const mlOrderStartedAt = Date.now();
+      const mlOrderResponse = await getMlOrder(orderId, resilienceCtx);
       timings.elapsed_ms_ml_order = mlOrderResponse.elapsedMs;
-
-      logger.info({
-        event: 'phase_ml_order_done',
-        phase: 'ml_order',
-        traceId,
-        orderId,
-        attempts: mlOrderResponse.attempts,
-        elapsed_ms_ml_order: timings.elapsed_ms_ml_order
-      });
 
       const mlOrder = mlOrderResponse.data;
       if (!mlOrder || !mlOrder.id) {
         throw new ProcessingError('Invalid ML order payload', {
-          stage: 'ML_ORDER',
+          stage: 'ml_order',
           ackStatus: 204,
-          summary: 'ML_ORDER payload does not contain id'
+          summary: 'ML_ORDER payload does not contain id',
+          errorCode: ERROR_CODES.INVALID_PAYLOAD
         });
       }
 
       mappedOrder = mapOrderDoc(mlOrder);
+      updateLogContext(ctx, { packId: mappedOrder.packId || null });
+
       await upsertOrderDocument(mappedOrder);
-      logger.info({
+      await recordPhase({
+        phase: 'ml_order',
+        startedAt: mlOrderStartedAt,
+        attempts: mlOrderResponse.attempts,
+        result: 'SUCCESS'
+      });
+
+      log.debug({
+        event: 'phase_ml_order_done',
+        phase: 'ml_order',
+        status: 'SUCCESS',
+        attempts: mlOrderResponse.attempts,
+        elapsedMs: timings.elapsed_ms_ml_order
+      });
+
+      log.debug({
         event: 'phase_persist_order_done',
         phase: 'persist_order',
-        traceId,
-        orderId
+        status: 'SUCCESS'
       });
 
       if (mappedOrder.itemId) {
-        const mlItemResult = await getMlItem(mappedOrder.itemId);
+        const mlItemStartedAt = Date.now();
+        const mlItemResult = await getMlItem(mappedOrder.itemId, resilienceCtx);
         timings.elapsed_ms_ml_item = mlItemResult.elapsedMs;
         mlItemResponse = mlItemResult.data;
         await updateOrderEnrichment(orderId, {
@@ -227,132 +378,262 @@ class ProcessMlOrderEventUseCase {
           'itemSnapshot.thumbnail': mlItemResponse.thumbnail || null,
           'itemSnapshot.fetchedAt': new Date()
         });
-        logger.info({
+
+        await recordPhase({
+          phase: 'ml_item',
+          startedAt: mlItemStartedAt,
+          attempts: mlItemResult.attempts,
+          result: 'SUCCESS'
+        });
+
+        log.debug({
           event: 'phase_ml_item_done',
           phase: 'ml_item',
-          traceId,
-          orderId,
+          status: 'SUCCESS',
           attempts: mlItemResult.attempts,
-          elapsed_ms_ml_item: timings.elapsed_ms_ml_item
+          elapsedMs: timings.elapsed_ms_ml_item
         });
       } else {
         warning = 'No itemId in ML order; skipping ML item lookup';
+        await recordPhase({
+          phase: 'ml_item',
+          startedAt: Date.now(),
+          result: 'SKIPPED',
+          errorSummary: warning
+        });
       }
 
       const preferredSku = mappedOrder.sku;
       const fallbackSku = mappedOrder.skuVariant;
       if (preferredSku) {
+        const stockStartedAt = Date.now();
         try {
-          const stockResult = await getStockBySku(preferredSku);
+          const stockResult = await getStockBySku(preferredSku, resilienceCtx);
           timings.elapsed_ms_stock = stockResult.elapsedMs;
           stockRows = stockResult.rows;
-          logger.info({
-            event: 'phase_stock_done',
-            phase: 'stock',
-            traceId,
-            orderId,
-            skuQueried: preferredSku,
-            attempts: stockResult.attempts,
-            elapsed_ms_stock: timings.elapsed_ms_stock,
-            rows: stockRows.length,
-            stockPayloadType: Array.isArray(stockResult.data) ? 'array' : typeof stockResult.data
-          });
 
           if (!stockRows.length && fallbackSku) {
-            const stockFallbackResult = await getStockBySku(fallbackSku);
-            timings.elapsed_ms_stock = stockFallbackResult.elapsedMs;
-            stockRows = stockFallbackResult.rows;
-            logger.warn({
-              event: 'phase_stock_fallback_empty_primary',
+            const fallbackResult = await getStockBySku(fallbackSku, resilienceCtx);
+            timings.elapsed_ms_stock = fallbackResult.elapsedMs;
+            stockRows = fallbackResult.rows;
+            stockStatusText = 'primary sku empty, used skuVariant fallback';
+
+            log.warn({
+              event: 'phase_stock_lookup_fallback_done',
               phase: 'stock',
-              traceId,
-              orderId,
+              status: 'PARTIAL_SUCCESS',
+              attempts: fallbackResult.attempts,
+              elapsedMs: timings.elapsed_ms_stock,
               skuQueried: fallbackSku,
               rows: stockRows.length
             });
           }
+
+          await recordPhase({
+            phase: 'stock',
+            startedAt: stockStartedAt,
+            attempts: stockResult.attempts,
+            result: stockRows.length ? 'SUCCESS' : 'PARTIAL_SUCCESS',
+            errorSummary: stockRows.length ? null : 'No stock rows returned'
+          });
+
+          log.debug({
+            event: 'phase_stock_lookup_done',
+            phase: 'stock',
+            status: stockRows.length ? 'SUCCESS' : 'PARTIAL_SUCCESS',
+            attempts: stockResult.attempts,
+            elapsedMs: timings.elapsed_ms_stock,
+            skuQueried: preferredSku,
+            rows: stockRows.length,
+            circuitState: stockResult.circuit ? stockResult.circuit.state : null
+          });
         } catch (stockError) {
+          const stockClassified = classifyDependencyError({
+            dependency: 'stock',
+            error: stockError,
+            fallbackSummary: 'Stock lookup failed'
+          });
           warning = `Stock unavailable: ${toSummaryMessage(stockError)}`;
-          if (fallbackSku) {
+          stockStatusText = 'Stock no disponible temporalmente (degradado)';
+
+          if (fallbackSku && stockClassified.errorCode !== ERROR_CODES.CIRCUIT_OPEN_STOCK) {
             try {
-              const stockFallbackResult = await getStockBySku(fallbackSku);
-              timings.elapsed_ms_stock = stockFallbackResult.elapsedMs;
-              stockRows = stockFallbackResult.rows;
-              logger.warn({
-                event: 'phase_stock_fallback_done',
+              const fallbackResult = await getStockBySku(fallbackSku, resilienceCtx);
+              timings.elapsed_ms_stock = fallbackResult.elapsedMs;
+              stockRows = fallbackResult.rows;
+              stockStatusText = 'primary sku failed, used skuVariant fallback';
+
+              log.warn({
+                event: 'phase_stock_lookup_fallback_done',
                 phase: 'stock',
-                traceId,
-                orderId,
+                status: 'PARTIAL_SUCCESS',
+                attempts: fallbackResult.attempts,
+                elapsedMs: timings.elapsed_ms_stock,
                 skuQueried: fallbackSku,
-                rows: stockRows.length
+                rows: stockRows.length,
+                errorCode: stockClassified.errorCode,
+                errorSummary: stockClassified.errorSummary,
+                errorDetails: stockClassified.errorDetails
               });
             } catch (fallbackError) {
+              const fallbackClassified = classifyDependencyError({
+                dependency: 'stock',
+                error: fallbackError,
+                fallbackSummary: 'Stock fallback lookup failed'
+              });
               warning = `Stock unavailable (sku+variant): ${toSummaryMessage(fallbackError)}`;
-              logger.warn({
-                event: 'phase_stock_fallback_failed',
+
+              await recordPhase({
                 phase: 'stock',
-                traceId,
-                orderId,
-                error: fallbackError.message
+                startedAt: stockStartedAt,
+                attempts: fallbackError.attempts || 1,
+                result: 'FAILED_TRANSIENT',
+                errorCode: fallbackClassified.errorCode,
+                errorSummary: fallbackClassified.errorSummary,
+                errorDetails: fallbackClassified.errorDetails
+              });
+
+              log.warn({
+                event: 'phase_stock_lookup_degraded',
+                phase: 'stock',
+                status: 'PARTIAL_SUCCESS',
+                errorCode: fallbackClassified.errorCode,
+                errorSummary: fallbackClassified.errorSummary,
+                errorDetails: fallbackClassified.errorDetails,
+                circuitState: getStockCircuitSnapshot().state
               });
             }
+          } else {
+            await recordPhase({
+              phase: 'stock',
+              startedAt: stockStartedAt,
+              attempts: stockError.attempts || 1,
+              result: stockClassified.errorCode === ERROR_CODES.CIRCUIT_OPEN_STOCK ? 'SKIPPED_CIRCUIT_OPEN' : 'FAILED_TRANSIENT',
+              errorCode: stockClassified.errorCode,
+              errorSummary: stockClassified.errorSummary,
+              errorDetails: stockClassified.errorDetails
+            });
+
+            log.warn({
+              event: 'phase_stock_lookup_degraded',
+              phase: 'stock',
+              status: 'PARTIAL_SUCCESS',
+              errorCode: stockClassified.errorCode,
+              errorSummary: stockClassified.errorSummary,
+              errorDetails: stockClassified.errorDetails,
+              circuitState: getStockCircuitSnapshot().state
+            });
           }
         }
       } else {
         warning = 'No sku available for stock lookup';
+        stockStatusText = 'Stock no disponible por SKU faltante';
+
+        await recordPhase({
+          phase: 'stock',
+          startedAt: Date.now(),
+          result: 'SKIPPED',
+          errorSummary: warning
+        });
+
+        log.warn({
+          event: 'phase_stock_lookup_degraded',
+          phase: 'stock',
+          status: 'PARTIAL_SUCCESS',
+          errorCode: ERROR_CODES.INVALID_PAYLOAD,
+          errorSummary: warning
+        });
       }
     } catch (error) {
-      const classifiedError =
-        error instanceof ProcessingError ? error : classifyMlError(error, error.stage || 'PROCESSING');
+      let classifiedError;
+      if (error instanceof ProcessingError) {
+        classifiedError = {
+          errorCode: error.errorCode || ERROR_CODES.UNKNOWN_ERROR,
+          errorSummary: error.summary,
+          errorDetails: error.errorDetails || error.message,
+          ackStatus: error.ackStatus
+        };
+      } else {
+        classifiedError = classifyDependencyError({
+          dependency: 'ml_order',
+          error,
+          fallbackSummary: 'ML processing failed'
+        });
+      }
+
       timings.elapsed_ms_total = Date.now() - processStart;
+      finalErrorCode = classifiedError.errorCode;
+      finalErrorSummary = classifiedError.errorSummary;
+      finalErrorDetails = classifiedError.errorDetails;
+
+      await recordPhase({
+        phase: 'finalize',
+        startedAt: Date.now(),
+        result: getFailureStatusFromAck(classifiedError.ackStatus),
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary,
+        errorDetails: finalErrorDetails
+      });
 
       try {
         await sendTelegramNotification({
           html: buildErrorTelegramHtml({
             orderId,
-            stage: classifiedError.stage,
-            message: classifiedError.summary
+            traceId,
+            stage: error.stage || 'PROCESSING',
+            errorCode: finalErrorCode,
+            message: finalErrorSummary
           }),
           photoUrl: null,
           traceId,
           orderId
         });
       } catch (telegramError) {
-        logger.error({
+        log.error({
           event: 'phase_telegram_error_notification_failed',
-          phase: 'telegram_error',
-          traceId,
-          orderId,
-          error: telegramError.message
+          phase: 'telegram',
+          status: 'ERROR',
+          errorCode: ERROR_CODES.TELEGRAM_FAILED,
+          errorSummary: 'Failed to send error telegram',
+          errorDetails: telegramError.message
         });
       }
 
       try {
         await updateOrderEventStatus({
+          selector: runSelector,
           orderId,
-          status: classifiedError.ackStatus === 500 ? 'FAILED_TRANSIENT' : 'FAILED_PERMANENT',
+          packId: ctx.packId,
+          traceId,
+          messageId,
+          status: getFailureStatusFromAck(classifiedError.ackStatus),
           timings,
           warning,
-          errorSummary: classifiedError.summary,
-          stage: classifiedError.stage
+          errorCode: finalErrorCode,
+          errorSummary: finalErrorSummary,
+          errorDetails: finalErrorDetails,
+          stage: error.stage || 'PROCESSING',
+          phases
         });
       } catch (statusError) {
-        logger.error({
+        log.error({
           event: 'phase_final_status_update_failed',
-          phase: 'event_log_update',
-          traceId,
-          orderId,
-          error: statusError.message
+          phase: 'finalize',
+          status: 'ERROR',
+          errorCode: ERROR_CODES.MONGO_WRITE_FAILED,
+          errorSummary: 'Failed to update final event log status',
+          errorDetails: statusError.message
         });
       }
 
-      logger.error({
+      log.error({
         event: 'phase_processing_failed',
-        phase: classifiedError.stage,
-        traceId,
-        orderId,
-        ackStatus: classifiedError.ackStatus,
-        error: classifiedError.summary
+        phase: error.stage || 'PROCESSING',
+        status: 'ERROR',
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary,
+        errorDetails: finalErrorDetails,
+        ackStatus: classifiedError.ackStatus
       });
 
       return {
@@ -377,7 +658,9 @@ class ProcessMlOrderEventUseCase {
       permalink: mlItemResponse && mlItemResponse.permalink ? mlItemResponse.permalink : null,
       stockRows,
       timings,
-      totalMs
+      totalMs,
+      traceId,
+      stockStatusText
     });
     const itemPhotoUrl = resolveItemPhotoUrl(mlItemResponse);
 
@@ -388,47 +671,69 @@ class ProcessMlOrderEventUseCase {
         traceId,
         orderId
       });
-      logger.info({
+      log.debug({
         event: 'phase_telegram_done',
         phase: 'telegram',
-        traceId,
-        orderId
+        status: 'SUCCESS'
       });
     } catch (error) {
       warning = warning || `Telegram failed: ${toSummaryMessage(error)}`;
-      logger.error({
+      finalErrorCode = ERROR_CODES.TELEGRAM_FAILED;
+      finalErrorSummary = 'Telegram notification failed';
+      finalErrorDetails = error.message;
+      log.error({
         event: 'phase_telegram_failed',
         phase: 'telegram',
-        traceId,
-        orderId,
-        error: error.message
+        status: 'PARTIAL_SUCCESS',
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary,
+        errorDetails: finalErrorDetails
       });
     }
 
     try {
       await updateOrderEventStatus({
+        selector: runSelector,
         orderId,
+        packId: ctx.packId,
+        traceId,
+        messageId,
         status: warning ? 'PARTIAL_SUCCESS' : 'SUCCESS',
         timings,
         warning,
-        errorSummary: null,
-        stage: 'COMPLETED'
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary,
+        errorDetails: finalErrorDetails,
+        stage: 'COMPLETED',
+        phases
       });
-      logger.info({
-        event: 'phase_event_log_finalized',
-        phase: 'event_log_update',
-        traceId,
-        orderId,
+
+      await recordPhase({
+        phase: 'finalize',
+        startedAt: Date.now(),
+        result: warning ? 'PARTIAL_SUCCESS' : 'SUCCESS',
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary,
+        errorDetails: finalErrorDetails
+      });
+
+      log.debug({
+        event: 'phase_finalize_done',
+        phase: 'finalize',
         status: warning ? 'PARTIAL_SUCCESS' : 'SUCCESS',
-        elapsed_ms_total: timings.elapsed_ms_total
+        elapsedMs: timings.elapsed_ms_total,
+        warning: warning || null,
+        errorCode: finalErrorCode,
+        errorSummary: finalErrorSummary
       });
     } catch (statusError) {
-      logger.error({
+      log.error({
         event: 'phase_final_status_update_failed',
-        phase: 'event_log_update',
-        traceId,
-        orderId,
-        error: statusError.message
+        phase: 'finalize',
+        status: 'ERROR',
+        errorCode: ERROR_CODES.MONGO_WRITE_FAILED,
+        errorSummary: 'Failed to update final event log status',
+        errorDetails: statusError.message
       });
     }
 
