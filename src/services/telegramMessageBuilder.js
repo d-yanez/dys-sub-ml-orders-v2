@@ -67,12 +67,13 @@ function buildStockTable(stockRows, compact) {
 }
 
 function buildTelegramHtml(payload, compact = false) {
-  const suggestedLocation = pickSuggestedLocation(payload.stockRows);
   const title = compact ? '<b>🛒 Orden ML</b>' : '<b>🛒 Nueva orden ML</b>';
-  const nameValue = escapeHtml(payload.name || '-');
+  const rawName = String(payload.name || '-');
+  const truncatedName = rawName.length > 60 ? `${rawName.slice(0, 57)}...` : rawName;
+  const nameValue = escapeHtml(truncatedName);
   const permalink = payload.permalink ? escapeHtml(payload.permalink) : null;
   const permalinkLine = permalink
-    ? `<b>Publicacion:</b> <a href="${permalink}">Ver en Mercado Libre</a>`
+    ? `<a href="${permalink}">Ver en ML</a>`
     : '<i>Sin permalink</i>';
 
   const lines = [
@@ -81,30 +82,14 @@ function buildTelegramHtml(payload, compact = false) {
     `<b>PackId:</b> ${formatCode(payload.packId, '-')}`,
     `<b>SKU:</b> ${formatCode(payload.sku, '-')}`,
     `<b>SKU Variant:</b> ${formatCode(payload.skuVariant, 'N/A')}`,
-    `<b>Nombre:</b> ${nameValue}`,
-    `<b>Cantidad:</b> <b>${escapeHtml(payload.quantity || 0)}</b>`,
-    `<b>PaymentId:</b> ${formatCode(payload.paymentId, '-')}`,
+    `${nameValue}`,
+    `QTY: ${escapeHtml(payload.quantity || 0)}`,
     `<b>ShippingId:</b> ${formatCode(payload.shippingId, '-')}`
   ];
 
-  if (suggestedLocation) {
-    lines.push(
-      `✅ Ubicacion sugerida: <b>${escapeHtml(suggestedLocation.location)}</b> (${escapeHtml(suggestedLocation.stock)})`
-    );
-  } else {
-    lines.push('⚠️ Ubicacion sugerida: <i>sin stock/stock no encontrado</i>');
-  }
-
-  if (payload.stockStatusText) {
-    lines.push(`<b>Estado stock:</b> ${escapeHtml(payload.stockStatusText)}`);
-  }
-
   lines.push(buildStockTable(payload.stockRows, compact));
-  lines.push(
-    `<b>Tiempos:</b> ML Order ${formatCode(`${payload.timings.elapsed_ms_ml_order || 0} ms`, '0 ms')} | ML Item ${formatCode(`${payload.timings.elapsed_ms_ml_item || 0} ms`, '0 ms')} | Stock ${formatCode(`${payload.timings.elapsed_ms_stock || 0} ms`, '0 ms')} | <b>Total:</b> ${escapeHtml(payload.totalMs || payload.timings.elapsed_ms_total || 0)} ms`
-  );
+  lines.push(`Tiempos ${escapeHtml(payload.totalMs || payload.timings.elapsed_ms_total || 0)} ms`);
   lines.push(`<b>TraceId:</b> ${formatCode(payload.traceId, '-')}`);
-  lines.push(`🔎 Buscar en GCP: <code>traceId=${escapeHtml(payload.traceId || '-')}</code>`);
   lines.push(permalinkLine);
 
   let html = lines.join('\n');
