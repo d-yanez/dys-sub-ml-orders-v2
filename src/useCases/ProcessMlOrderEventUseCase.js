@@ -66,6 +66,7 @@ function mapOrderDoc(mlOrder) {
     quantity: firstOrderItem.quantity || 0,
     paymentId: payments[0] ? payments[0].id : null,
     shippingId: shipping.id || null,
+    status: null,
     orderItems: mappedOrderItems
   };
 }
