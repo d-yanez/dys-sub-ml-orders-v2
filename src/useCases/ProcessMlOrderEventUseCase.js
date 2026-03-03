@@ -101,6 +101,7 @@ class ProcessMlOrderEventUseCase {
     const timings = {
       elapsed_ms_ml_order: 0,
       elapsed_ms_ml_item: 0,
+      elapsed_ms_ml_item_detail: 0,
       elapsed_ms_stock: 0,
       elapsed_ms_total: 0
     };
@@ -349,6 +350,8 @@ class ProcessMlOrderEventUseCase {
     let mlItemResponse = null;
     let stockRows = [];
     let stockStatusText = null;
+    let derivedSkuVariant = null;
+    let effectiveSkuVariant = null;
 
     try {
       const mlOrderStartedAt = Date.now();
@@ -392,29 +395,82 @@ class ProcessMlOrderEventUseCase {
 
       if (mappedOrder.itemId) {
         const mlItemStartedAt = Date.now();
-        const mlItemResult = await getMlItem(mappedOrder.itemId, resilienceCtx);
-        timings.elapsed_ms_ml_item = mlItemResult.elapsedMs;
-        mlItemResponse = mlItemResult.data;
-        await updateOrderEnrichment(orderId, {
-          'itemSnapshot.permalink': mlItemResponse.permalink || null,
-          'itemSnapshot.thumbnail': mlItemResponse.thumbnail || null,
-          'itemSnapshot.fetchedAt': new Date()
-        });
+        try {
+          const mlItemResult = await getMlItem(mappedOrder.itemId, resilienceCtx);
+          timings.elapsed_ms_ml_item = mlItemResult.elapsedMs;
+          timings.elapsed_ms_ml_item_detail = mlItemResult.elapsedMs;
+          mlItemResponse = mlItemResult.data;
+          const relatedItemId =
+            mlItemResponse && Array.isArray(mlItemResponse.item_relations) && mlItemResponse.item_relations[0]
+              ? mlItemResponse.item_relations[0].id
+              : null;
+          derivedSkuVariant = stripMlcPrefix(relatedItemId) || null;
 
-        await recordPhase({
-          phase: 'ml_item',
-          startedAt: mlItemStartedAt,
-          attempts: mlItemResult.attempts,
-          result: 'SUCCESS'
-        });
+          if (derivedSkuVariant) {
+            log.info({
+              event: 'phase_ml_item_variant_detected',
+              phase: 'ml_item',
+              status: 'SUCCESS',
+              traceId,
+              orderId,
+              itemId: mappedOrder.itemId,
+              derivedSkuVariant
+            });
+          }
 
-        log.debug({
-          event: 'phase_ml_item_done',
-          phase: 'ml_item',
-          status: 'SUCCESS',
-          attempts: mlItemResult.attempts,
-          elapsedMs: timings.elapsed_ms_ml_item
-        });
+          await updateOrderEnrichment(orderId, {
+            'itemSnapshot.permalink': mlItemResponse.permalink || null,
+            'itemSnapshot.thumbnail': mlItemResponse.thumbnail || null,
+            'itemSnapshot.fetchedAt': new Date(),
+            skuVariant: derivedSkuVariant || mappedOrder.skuVariant || null
+          });
+
+          await recordPhase({
+            phase: 'ml_item',
+            startedAt: mlItemStartedAt,
+            attempts: mlItemResult.attempts,
+            result: 'SUCCESS'
+          });
+
+          log.debug({
+            event: 'phase_ml_item_done',
+            phase: 'ml_item',
+            status: 'SUCCESS',
+            attempts: mlItemResult.attempts,
+            elapsedMs: timings.elapsed_ms_ml_item_detail
+          });
+        } catch (mlItemError) {
+          const mlItemClassified = classifyDependencyError({
+            dependency: 'ml_item',
+            error: mlItemError,
+            fallbackSummary: 'ML item detail failed; continuing without derived skuVariant'
+          });
+          timings.elapsed_ms_ml_item = mlItemError && mlItemError.elapsedMs ? mlItemError.elapsedMs : Date.now() - mlItemStartedAt;
+          timings.elapsed_ms_ml_item_detail = timings.elapsed_ms_ml_item;
+          warning = warning || `ML item detail unavailable: ${toSummaryMessage(mlItemError)}`;
+
+          await recordPhase({
+            phase: 'ml_item',
+            startedAt: mlItemStartedAt,
+            attempts: (mlItemError && mlItemError.attempts) || 1,
+            result: 'FAILED_TRANSIENT',
+            errorCode: mlItemClassified.errorCode,
+            errorSummary: mlItemClassified.errorSummary,
+            errorDetails: mlItemClassified.errorDetails
+          });
+
+          log.warn({
+            event: 'phase_ml_item_degraded',
+            phase: 'ml_item',
+            status: 'PARTIAL_SUCCESS',
+            traceId,
+            orderId,
+            itemId: mappedOrder.itemId,
+            elapsedMs: timings.elapsed_ms_ml_item_detail,
+            errorSummary: toSummaryMessage(mlItemError),
+            errorDetails: mlItemError.message
+          });
+        }
       } else {
         warning = 'No itemId in ML order; skipping ML item lookup';
         await recordPhase({
@@ -426,7 +482,8 @@ class ProcessMlOrderEventUseCase {
       }
 
       const preferredSku = mappedOrder.sku;
-      const fallbackSku = mappedOrder.skuVariant;
+      effectiveSkuVariant = derivedSkuVariant || mappedOrder.skuVariant || null;
+      const fallbackSku = effectiveSkuVariant && effectiveSkuVariant !== preferredSku ? effectiveSkuVariant : null;
       if (preferredSku) {
         const stockStartedAt = Date.now();
         try {
@@ -440,12 +497,15 @@ class ProcessMlOrderEventUseCase {
             stockRows = fallbackResult.rows;
             stockStatusText = 'primary sku empty, used skuVariant fallback';
 
-            log.warn({
+            log.info({
               event: 'phase_stock_lookup_fallback_done',
               phase: 'stock',
               status: 'PARTIAL_SUCCESS',
+              traceId,
+              orderId,
               attempts: fallbackResult.attempts,
               elapsedMs: timings.elapsed_ms_stock,
+              preferredSku,
               skuQueried: fallbackSku,
               rows: stockRows.length
             });
@@ -485,12 +545,15 @@ class ProcessMlOrderEventUseCase {
               stockRows = fallbackResult.rows;
               stockStatusText = 'primary sku failed, used skuVariant fallback';
 
-              log.warn({
+              log.info({
                 event: 'phase_stock_lookup_fallback_done',
                 phase: 'stock',
                 status: 'PARTIAL_SUCCESS',
+                traceId,
+                orderId,
                 attempts: fallbackResult.attempts,
                 elapsedMs: timings.elapsed_ms_stock,
+                preferredSku,
                 skuQueried: fallbackSku,
                 rows: stockRows.length,
                 errorCode: stockClassified.errorCode,
@@ -670,7 +733,7 @@ class ProcessMlOrderEventUseCase {
       orderId: mappedOrder.orderId,
       packId: mappedOrder.packId,
       sku: mappedOrder.sku,
-      skuVariant: mappedOrder.skuVariant,
+      skuVariant: effectiveSkuVariant,
       name: mappedOrder.name,
       quantity: mappedOrder.quantity,
       paymentId: mappedOrder.paymentId,
