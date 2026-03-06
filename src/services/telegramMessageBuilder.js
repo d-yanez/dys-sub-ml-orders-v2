@@ -74,6 +74,9 @@ function resolveLogisticTypeLabel(logisticType) {
   if (normalized === 'self_service') {
     return 'ML Flex';
   }
+  if (normalized === 'fulfillment') {
+    return 'ML FULL';
+  }
   return 'Desconocido';
 }
 
