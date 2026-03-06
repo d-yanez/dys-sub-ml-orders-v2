@@ -354,6 +354,7 @@ class ProcessMlOrderEventUseCase {
     let stockStatusText = null;
     let derivedSkuVariant = null;
     let effectiveSkuVariant = null;
+    let effectiveLogisticType = null;
 
     try {
       const mlOrderStartedAt = Date.now();
@@ -402,6 +403,7 @@ class ProcessMlOrderEventUseCase {
           timings.elapsed_ms_ml_shipment = mlShipmentResult.elapsedMs;
           const mlShipmentResponse = mlShipmentResult.data || {};
           const logisticType = mlShipmentResponse.logistic_type || null;
+          effectiveLogisticType = logisticType;
           const shipmentStatus =
             typeof mlShipmentResponse.status === 'string' && mlShipmentResponse.status.trim()
               ? mlShipmentResponse.status.trim()
@@ -810,6 +812,7 @@ class ProcessMlOrderEventUseCase {
       quantity: mappedOrder.quantity,
       paymentId: mappedOrder.paymentId,
       shippingId: mappedOrder.shippingId,
+      logisticType: effectiveLogisticType,
       permalink: mlItemResponse && mlItemResponse.permalink ? mlItemResponse.permalink : null,
       stockRows,
       timings,

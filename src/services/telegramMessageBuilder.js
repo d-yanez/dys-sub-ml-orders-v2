@@ -66,8 +66,20 @@ function buildStockTable(stockRows, compact) {
   return lines.join('\n');
 }
 
+function resolveLogisticTypeLabel(logisticType) {
+  const normalized = String(logisticType || '').trim().toLowerCase();
+  if (normalized === 'xd_drop_off') {
+    return 'ML Envios';
+  }
+  if (normalized === 'self_service') {
+    return 'ML Flex';
+  }
+  return 'Desconocido';
+}
+
 function buildTelegramHtml(payload, compact = false) {
   const title = compact ? '<b>🛒 Orden ML</b>' : '<b>🛒 Nueva orden ML</b>';
+  const logisticTypeLabel = resolveLogisticTypeLabel(payload.logisticType);
   const rawName = String(payload.name || '-');
   const truncatedName = rawName.length > 60 ? `${rawName.slice(0, 57)}...` : rawName;
   const nameValue = escapeHtml(truncatedName);
@@ -78,6 +90,7 @@ function buildTelegramHtml(payload, compact = false) {
 
   const lines = [
     title,
+    `<b>Tipo Logistica:</b> <b>${escapeHtml(logisticTypeLabel)}</b>`,
     `<b>OrderId:</b> ${formatCode(payload.orderId, '-')}`,
     `<b>PackId:</b> ${formatCode(payload.packId, '-')}`,
     `<b>SKU:</b> ${formatCode(payload.sku, '-')}`,
