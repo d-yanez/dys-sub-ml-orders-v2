@@ -6,6 +6,7 @@ const ERROR_CODES = {
 
   TIMEOUT_ML_ORDER: 'TIMEOUT_ML_ORDER',
   TIMEOUT_ML_ITEM: 'TIMEOUT_ML_ITEM',
+  TIMEOUT_ML_SHIPMENT: 'TIMEOUT_ML_SHIPMENT',
   TIMEOUT_STOCK: 'TIMEOUT_STOCK',
   TIMEOUT_TELEGRAM: 'TIMEOUT_TELEGRAM',
   TIMEOUT_PROCESS_BUDGET: 'TIMEOUT_PROCESS_BUDGET',
@@ -13,17 +14,21 @@ const ERROR_CODES = {
   ABORTED_STOCK: 'ABORTED_STOCK',
   ABORTED_ML_ORDER: 'ABORTED_ML_ORDER',
   ABORTED_ML_ITEM: 'ABORTED_ML_ITEM',
+  ABORTED_ML_SHIPMENT: 'ABORTED_ML_SHIPMENT',
 
   HTTP_429_ML_ORDER: 'HTTP_429_ML_ORDER',
   HTTP_429_ML_ITEM: 'HTTP_429_ML_ITEM',
+  HTTP_429_ML_SHIPMENT: 'HTTP_429_ML_SHIPMENT',
   HTTP_429_STOCK: 'HTTP_429_STOCK',
 
   HTTP_5XX_ML_ORDER: 'HTTP_5XX_ML_ORDER',
   HTTP_5XX_ML_ITEM: 'HTTP_5XX_ML_ITEM',
+  HTTP_5XX_ML_SHIPMENT: 'HTTP_5XX_ML_SHIPMENT',
   HTTP_5XX_STOCK: 'HTTP_5XX_STOCK',
 
   NETWORK_ML_ORDER: 'NETWORK_ML_ORDER',
   NETWORK_ML_ITEM: 'NETWORK_ML_ITEM',
+  NETWORK_ML_SHIPMENT: 'NETWORK_ML_SHIPMENT',
   NETWORK_STOCK: 'NETWORK_STOCK',
 
   MONGO_WRITE_FAILED: 'MONGO_WRITE_FAILED',
@@ -35,20 +40,25 @@ const ERROR_CODES = {
 const transientCodes = new Set([
   ERROR_CODES.TIMEOUT_ML_ORDER,
   ERROR_CODES.TIMEOUT_ML_ITEM,
+  ERROR_CODES.TIMEOUT_ML_SHIPMENT,
   ERROR_CODES.TIMEOUT_STOCK,
   ERROR_CODES.TIMEOUT_TELEGRAM,
   ERROR_CODES.TIMEOUT_PROCESS_BUDGET,
   ERROR_CODES.ABORTED_STOCK,
   ERROR_CODES.ABORTED_ML_ORDER,
   ERROR_CODES.ABORTED_ML_ITEM,
+  ERROR_CODES.ABORTED_ML_SHIPMENT,
   ERROR_CODES.HTTP_429_ML_ORDER,
   ERROR_CODES.HTTP_429_ML_ITEM,
+  ERROR_CODES.HTTP_429_ML_SHIPMENT,
   ERROR_CODES.HTTP_429_STOCK,
   ERROR_CODES.HTTP_5XX_ML_ORDER,
   ERROR_CODES.HTTP_5XX_ML_ITEM,
+  ERROR_CODES.HTTP_5XX_ML_SHIPMENT,
   ERROR_CODES.HTTP_5XX_STOCK,
   ERROR_CODES.NETWORK_ML_ORDER,
   ERROR_CODES.NETWORK_ML_ITEM,
+  ERROR_CODES.NETWORK_ML_SHIPMENT,
   ERROR_CODES.NETWORK_STOCK,
   ERROR_CODES.CIRCUIT_OPEN_STOCK,
   ERROR_CODES.MONGO_WRITE_FAILED,
@@ -84,6 +94,9 @@ function normalizeErrorCode({ dependency, error }) {
     if (dependency === 'ml_item') {
       return ERROR_CODES.ABORTED_ML_ITEM;
     }
+    if (dependency === 'ml_shipment') {
+      return ERROR_CODES.ABORTED_ML_SHIPMENT;
+    }
   }
 
   if (error && error.isTimeout) {
@@ -95,6 +108,9 @@ function normalizeErrorCode({ dependency, error }) {
     }
     if (dependency === 'ml_item') {
       return ERROR_CODES.TIMEOUT_ML_ITEM;
+    }
+    if (dependency === 'ml_shipment') {
+      return ERROR_CODES.TIMEOUT_ML_SHIPMENT;
     }
     return ERROR_CODES.TIMEOUT_PROCESS_BUDGET;
   }
@@ -109,6 +125,9 @@ function normalizeErrorCode({ dependency, error }) {
     if (dependency === 'ml_item') {
       return ERROR_CODES.HTTP_429_ML_ITEM;
     }
+    if (dependency === 'ml_shipment') {
+      return ERROR_CODES.HTTP_429_ML_SHIPMENT;
+    }
   }
 
   if (status >= 500) {
@@ -121,6 +140,9 @@ function normalizeErrorCode({ dependency, error }) {
     if (dependency === 'ml_item') {
       return ERROR_CODES.HTTP_5XX_ML_ITEM;
     }
+    if (dependency === 'ml_shipment') {
+      return ERROR_CODES.HTTP_5XX_ML_SHIPMENT;
+    }
   }
 
   if (error && error.isNetworkError) {
@@ -132,6 +154,9 @@ function normalizeErrorCode({ dependency, error }) {
     }
     if (dependency === 'ml_item') {
       return ERROR_CODES.NETWORK_ML_ITEM;
+    }
+    if (dependency === 'ml_shipment') {
+      return ERROR_CODES.NETWORK_ML_SHIPMENT;
     }
   }
 

@@ -12,7 +12,7 @@ const {
 } = require('../repositories/eventOrderLogsRepository');
 const { acquireLease } = require('../repositories/leaseLock');
 const { upsertOrderDocument, updateOrderEnrichment } = require('../repositories/orderRepository');
-const { getMlOrder, getMlItem } = require('../services/mlService');
+const { getMlOrder, getMlItem, getMlShipment } = require('../services/mlService');
 const { getStockBySku, getStockCircuitSnapshot } = require('../services/stockService');
 const { buildTelegramHtml, buildErrorTelegramHtml } = require('../services/telegramMessageBuilder');
 const ProcessingError = require('../utils/processingError');
@@ -101,6 +101,7 @@ class ProcessMlOrderEventUseCase {
     const messageId = message.messageId || null;
     const timings = {
       elapsed_ms_ml_order: 0,
+      elapsed_ms_ml_shipment: 0,
       elapsed_ms_ml_item: 0,
       elapsed_ms_ml_item_detail: 0,
       elapsed_ms_stock: 0,
@@ -393,6 +394,76 @@ class ProcessMlOrderEventUseCase {
         phase: 'persist_order',
         status: 'SUCCESS'
       });
+
+      if (mappedOrder.shippingId) {
+        const mlShipmentStartedAt = Date.now();
+        try {
+          const mlShipmentResult = await getMlShipment(mappedOrder.shippingId, resilienceCtx);
+          timings.elapsed_ms_ml_shipment = mlShipmentResult.elapsedMs;
+          const mlShipmentResponse = mlShipmentResult.data || {};
+          const logisticType = mlShipmentResponse.logistic_type || null;
+          const shipmentStatus =
+            typeof mlShipmentResponse.status === 'string' && mlShipmentResponse.status.trim()
+              ? mlShipmentResponse.status.trim()
+              : null;
+          const shipmentEnrichment = {
+            logisticType
+          };
+          if (shipmentStatus) {
+            shipmentEnrichment.status = shipmentStatus;
+          }
+
+          await updateOrderEnrichment(orderId, shipmentEnrichment);
+
+          await recordPhase({
+            phase: 'ml_shipment',
+            startedAt: mlShipmentStartedAt,
+            attempts: mlShipmentResult.attempts,
+            result: 'SUCCESS'
+          });
+
+          log.debug({
+            event: 'phase_ml_shipment_done',
+            phase: 'ml_shipment',
+            status: 'SUCCESS',
+            attempts: mlShipmentResult.attempts,
+            elapsedMs: timings.elapsed_ms_ml_shipment
+          });
+        } catch (mlShipmentError) {
+          const mlShipmentClassified = classifyDependencyError({
+            dependency: 'ml_shipment',
+            error: mlShipmentError,
+            fallbackSummary: 'ML shipment detail failed'
+          });
+          timings.elapsed_ms_ml_shipment =
+            mlShipmentError && mlShipmentError.elapsedMs ? mlShipmentError.elapsedMs : Date.now() - mlShipmentStartedAt;
+
+          await recordPhase({
+            phase: 'ml_shipment',
+            startedAt: mlShipmentStartedAt,
+            attempts: (mlShipmentError && mlShipmentError.attempts) || 1,
+            result: 'FAILED_TRANSIENT',
+            errorCode: mlShipmentClassified.errorCode,
+            errorSummary: mlShipmentClassified.errorSummary,
+            errorDetails: mlShipmentClassified.errorDetails
+          });
+
+          throw new ProcessingError(mlShipmentClassified.errorSummary, {
+            stage: 'ml_shipment',
+            ackStatus: 500,
+            summary: mlShipmentClassified.errorSummary,
+            errorCode: mlShipmentClassified.errorCode,
+            errorDetails: mlShipmentClassified.errorDetails
+          });
+        }
+      } else {
+        await recordPhase({
+          phase: 'ml_shipment',
+          startedAt: Date.now(),
+          result: 'SKIPPED',
+          errorSummary: 'No shippingId in ML order; skipping ML shipment lookup'
+        });
+      }
 
       if (mappedOrder.itemId) {
         const mlItemStartedAt = Date.now();

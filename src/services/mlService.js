@@ -33,7 +33,24 @@ async function getMlItem(itemId, resilienceCtx = {}) {
   });
 }
 
+async function getMlShipment(shippingId, resilienceCtx = {}) {
+  const url = `${env.mlAuthBaseUrl}/ml/7617772409564070/shipments/${encodeURIComponent(shippingId)}`;
+
+  return requestJsonWithRetry({
+    url,
+    method: 'GET',
+    headers: {
+      'api-key': env.apiKeyShipments
+    },
+    timeoutMs: env.httpTimeoutMsMlShipment,
+    maxAttempts: env.retryMaxAttemptsMlShipment,
+    budgetStartedAt: resilienceCtx.startedAt,
+    totalBudgetMs: resilienceCtx.totalBudgetMs
+  });
+}
+
 module.exports = {
   getMlOrder,
-  getMlItem
+  getMlItem,
+  getMlShipment
 };

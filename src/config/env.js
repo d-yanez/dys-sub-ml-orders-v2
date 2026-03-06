@@ -13,6 +13,7 @@ const env = {
   mongodbDbName: process.env.MONGODB_DB_NAME || 'mlDB',
   eventLogTtlDays: parseIntOrDefault(process.env.EVENT_LOG_TTL_DAYS, 60),
   apiKeyMl: process.env.API_KEY_ML || '',
+  apiKeyShipments: process.env.API_KEY_SHIPMENTS || '',
   apiKeyStock: process.env.API_KEY_STOCK || '',
   mlAuthBaseUrl:
     process.env.ML_AUTH_BASE_URL ||
@@ -22,9 +23,11 @@ const env = {
     'https://dys-api-stock-785293986978.us-central1.run.app',
   httpTimeoutMsMlOrder: parseIntOrDefault(process.env.HTTP_TIMEOUT_MS_ML_ORDER, 2500),
   httpTimeoutMsMlItem: parseIntOrDefault(process.env.HTTP_TIMEOUT_MS_ML_ITEM, 2500),
+  httpTimeoutMsMlShipment: parseIntOrDefault(process.env.HTTP_TIMEOUT_MS_ML_SHIPMENT, 2500),
   httpTimeoutMsStock: parseIntOrDefault(process.env.HTTP_TIMEOUT_MS_STOCK, 2000),
   retryMaxAttemptsMlOrder: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_ML_ORDER, 3),
   retryMaxAttemptsMlItem: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_ML_ITEM, 3),
+  retryMaxAttemptsMlShipment: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_ML_SHIPMENT, 3),
   retryMaxAttemptsStock: parseIntOrDefault(process.env.RETRY_MAX_ATTEMPTS_STOCK, 2),
   processTotalBudgetMs: parseIntOrDefault(process.env.PROCESS_TOTAL_BUDGET_MS, 10000),
   processingLeaseMs: parseIntOrDefault(process.env.PROCESSING_LEASE_MS, 30000),
