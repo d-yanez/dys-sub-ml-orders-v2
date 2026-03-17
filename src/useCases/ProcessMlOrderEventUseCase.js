@@ -492,12 +492,21 @@ class ProcessMlOrderEventUseCase {
             });
           }
 
-          await updateOrderEnrichment(orderId, {
+          const rawUserProductId = mlItemResponse && mlItemResponse.user_product_id;
+          const normalizedUserProductId = typeof rawUserProductId === 'string' ? rawUserProductId.trim() : '';
+
+          const enrichmentDoc = {
             'itemSnapshot.permalink': mlItemResponse.permalink || null,
             'itemSnapshot.thumbnail': mlItemResponse.thumbnail || null,
             'itemSnapshot.fetchedAt': new Date(),
             skuVariant: derivedSkuVariant || mappedOrder.skuVariant || null
-          });
+          };
+
+          if (normalizedUserProductId) {
+            enrichmentDoc.user_product_id = normalizedUserProductId;
+          }
+
+          await updateOrderEnrichment(orderId, enrichmentDoc);
 
           await recordPhase({
             phase: 'ml_item',
