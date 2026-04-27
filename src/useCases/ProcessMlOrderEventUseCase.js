@@ -17,6 +17,7 @@ const { getStockBySku, getStockCircuitSnapshot } = require('../services/stockSer
 const { buildTelegramHtml, buildErrorTelegramHtml } = require('../services/telegramMessageBuilder');
 const ProcessingError = require('../utils/processingError');
 const { ERROR_CODES, classifyDependencyError } = require('../utils/errorCatalog');
+const { buildShipmentEnrichment } = require('../utils/shipmentEnrichment');
 
 function extractOrderIdFromResource(payload) {
   const resource = payload && payload.resource ? String(payload.resource) : '';
@@ -402,18 +403,8 @@ class ProcessMlOrderEventUseCase {
           const mlShipmentResult = await getMlShipment(mappedOrder.shippingId, resilienceCtx);
           timings.elapsed_ms_ml_shipment = mlShipmentResult.elapsedMs;
           const mlShipmentResponse = mlShipmentResult.data || {};
-          const logisticType = mlShipmentResponse.logistic_type || null;
-          effectiveLogisticType = logisticType;
-          const shipmentStatus =
-            typeof mlShipmentResponse.status === 'string' && mlShipmentResponse.status.trim()
-              ? mlShipmentResponse.status.trim()
-              : null;
-          const shipmentEnrichment = {
-            logisticType
-          };
-          if (shipmentStatus) {
-            shipmentEnrichment.status = shipmentStatus;
-          }
+          const shipmentEnrichment = buildShipmentEnrichment(mlShipmentResponse, new Date());
+          effectiveLogisticType = shipmentEnrichment.logisticType;
 
           await updateOrderEnrichment(orderId, shipmentEnrichment);
 
