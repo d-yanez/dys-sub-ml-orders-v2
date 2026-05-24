@@ -1,0 +1,19 @@
+name: Dependency Security Baseline
+
+on:
+  pull_request:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  deps-security-baseline:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm i -g pnpm@10.24.0
+      - run: pnpm --version
+      - run: pnpm install --frozen-lockfile --ignore-scripts || pnpm install --ignore-scripts
+      - run: pnpm run deps:policy
+      - run: pnpm run deps:policy:lockfile
+      - run: pnpm audit --audit-level high

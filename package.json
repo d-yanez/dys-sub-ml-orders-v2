@@ -6,7 +6,10 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "deps:policy": "node -e \"const p=require('./package.json');const bad=[];for(const s of ['dependencies','devDependencies','optionalDependencies']){for(const [n,v] of Object.entries(p[s]||{})){if(v==='latest'||v==='*')bad.push(s+':'+n+'@'+v)}} if(bad.length){console.error('Blocked dependency specs\\n'+bad.join('\\n'));process.exit(1)} console.log('deps policy ok')\"",
+    "deps:install:ci": "npm ci --ignore-scripts",
+    "deps:policy:lockfile": "node -e \"const fs=require('fs');const f=fs.existsSync('pnpm-lock.yaml')?'pnpm-lock.yaml':(fs.existsSync('package-lock.json')?'package-lock.json':null); if(!f){console.log('no lockfile found');process.exit(0)} const t=fs.readFileSync(f,'utf8');const bad=[...t.matchAll(/https?:\\/\\/([^\\s'\\\"]+)/g)].map(m=>m[1]).filter(h=>!h.startsWith('registry.npmjs.org')); if(bad.length){console.error('Disallowed lockfile hosts:\\n'+[...new Set(bad)].join('\\n'));process.exit(1)} console.log('lockfile host policy ok')\""
   },
   "engines": {
     "node": ">=20.0.0"
