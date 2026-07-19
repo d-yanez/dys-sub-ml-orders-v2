@@ -7,6 +7,14 @@ function normalizeShipmentSubstatus(value) {
   return normalized || null;
 }
 
+function parseShipmentLastUpdated(value) {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function buildShipmentEnrichment(mlShipmentResponse, now = new Date()) {
   const source = mlShipmentResponse && typeof mlShipmentResponse === 'object' ? mlShipmentResponse : {};
 
@@ -21,6 +29,16 @@ function buildShipmentEnrichment(mlShipmentResponse, now = new Date()) {
     shipmentSubstatus: normalizeShipmentSubstatus(source.substatus),
     shipmentStatusUpdatedAt: now
   };
+  const sourceUpdatedAt = parseShipmentLastUpdated(source.last_updated);
+
+  Object.defineProperties(enrichment, {
+    sourceUpdatedAt: { value: sourceUpdatedAt, enumerable: false },
+    sourceTimestampMissing: { value: !sourceUpdatedAt, enumerable: false }
+  });
+
+  if (sourceUpdatedAt) {
+    enrichment.shipmentLastUpdatedAt = sourceUpdatedAt;
+  }
 
   if (status) {
     enrichment.status = status;
@@ -31,5 +49,6 @@ function buildShipmentEnrichment(mlShipmentResponse, now = new Date()) {
 
 module.exports = {
   buildShipmentEnrichment,
-  normalizeShipmentSubstatus
+  normalizeShipmentSubstatus,
+  parseShipmentLastUpdated
 };

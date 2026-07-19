@@ -18,6 +18,7 @@ const { buildTelegramHtml, buildErrorTelegramHtml } = require('../services/teleg
 const ProcessingError = require('../utils/processingError');
 const { ERROR_CODES, classifyDependencyError } = require('../utils/errorCatalog');
 const { buildShipmentEnrichment } = require('../utils/shipmentEnrichment');
+const { mapOrderDoc, stripMlcPrefix } = require('../utils/orderMapping');
 
 function extractOrderIdFromResource(payload) {
   const resource = payload && payload.resource ? String(payload.resource) : '';
@@ -26,50 +27,6 @@ function extractOrderIdFromResource(payload) {
     .filter(Boolean)
     .pop() || null;
   return { resource, orderId };
-}
-
-function stripMlcPrefix(idValue) {
-  if (idValue === null || idValue === undefined) {
-    return null;
-  }
-  return String(idValue).replace(/^MLC/i, '');
-}
-
-function mapOrderDoc(mlOrder) {
-  const orderItems = Array.isArray(mlOrder.order_items) ? mlOrder.order_items : [];
-  const firstOrderItem = orderItems[0] || {};
-  const firstItem = firstOrderItem.item || {};
-  const payments = Array.isArray(mlOrder.payments) ? mlOrder.payments : [];
-  const shipping = mlOrder.shipping || {};
-
-  const mappedOrderItems = orderItems.map((orderItem) => {
-    const item = orderItem.item || {};
-    const normalizedSku = stripMlcPrefix(item.id);
-    const normalizedVariant = stripMlcPrefix(item.variation_id);
-    return {
-      itemId: item.id || null,
-      variationId: item.variation_id || null,
-      sku: normalizedSku || null,
-      skuVariant: normalizedVariant || null,
-      name: item.title || null,
-      quantity: orderItem.quantity || 0
-    };
-  });
-
-  return {
-    orderId: String(mlOrder.id || ''),
-    packId: mlOrder.pack_id || null,
-    itemId: firstItem.id || null,
-    variationId: firstItem.variation_id || null,
-    sku: stripMlcPrefix(firstItem.id) || null,
-    skuVariant: stripMlcPrefix(firstItem.variation_id) || null,
-    name: firstItem.title || null,
-    quantity: firstOrderItem.quantity || 0,
-    paymentId: payments[0] ? payments[0].id : null,
-    shippingId: shipping.id || null,
-    status: null,
-    orderItems: mappedOrderItems
-  };
 }
 
 function toSummaryMessage(error) {
@@ -396,6 +353,13 @@ class ProcessMlOrderEventUseCase {
         phase: 'persist_order',
         status: 'SUCCESS'
       });
+      log.info({
+        event: 'order_commercial_fields_persisted',
+        phase: 'persist_order',
+        status: 'SUCCESS',
+        hasOrderStatus: Boolean(mappedOrder.orderStatus),
+        tagCount: mappedOrder.tags.length
+      });
 
       if (mappedOrder.shippingId) {
         const mlShipmentStartedAt = Date.now();
@@ -406,7 +370,25 @@ class ProcessMlOrderEventUseCase {
           const shipmentEnrichment = buildShipmentEnrichment(mlShipmentResponse, new Date());
           effectiveLogisticType = shipmentEnrichment.logisticType;
 
-          await updateOrderEnrichment(orderId, shipmentEnrichment);
+          if (shipmentEnrichment.sourceTimestampMissing) {
+            log.warn({
+              event: 'shipment_enrichment_timestamp_missing',
+              phase: 'ml_shipment',
+              status: 'PARTIAL_SUCCESS',
+              shippingId: mappedOrder.shippingId
+            });
+          }
+
+          const enrichmentResult = await updateOrderEnrichment(orderId, shipmentEnrichment);
+          if (enrichmentResult && enrichmentResult.staleSkipped) {
+            log.warn({
+              event: 'shipment_enrichment_stale_skipped',
+              phase: 'ml_shipment',
+              status: 'SUCCESS',
+              shippingId: mappedOrder.shippingId,
+              shipmentLastUpdatedAt: shipmentEnrichment.shipmentLastUpdatedAt
+            });
+          }
 
           await recordPhase({
             phase: 'ml_shipment',
