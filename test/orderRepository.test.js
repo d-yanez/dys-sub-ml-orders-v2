@@ -15,6 +15,20 @@ function loadRepositoryWithOrder(order) {
   return require('../src/repositories/orderRepository');
 }
 
+test('upsertOrderDocument lets replay replace persisted orderFulfilled state', async () => {
+  const calls = [];
+  const repository = loadRepositoryWithOrder({ async updateOne(selector, update, options) { calls.push({ selector, update, options }); } });
+
+  await repository.upsertOrderDocument({ orderId: '2000017470612098', orderFulfilled: false });
+  await repository.upsertOrderDocument({ orderId: '2000017470612098', orderFulfilled: true });
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[1].selector, { orderId: '2000017470612098' });
+  assert.equal(calls[0].update.$set.orderFulfilled, false);
+  assert.equal(calls[1].update.$set.orderFulfilled, true);
+  assert.deepEqual(calls[1].options, { upsert: true });
+});
+
 test('updateOrderEnrichment uses atomic shipmentLastUpdatedAt freshness guard', async () => {
   const calls = [];
   const repository = loadRepositoryWithOrder({ async updateOne(selector, update) { calls.push({ selector, update }); return { matchedCount: 1, modifiedCount: 1 }; } });

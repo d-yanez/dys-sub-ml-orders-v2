@@ -91,6 +91,14 @@ test('mapOrderDoc stores ML commercial state without shipment-owned fields', () 
   assert.equal(Object.prototype.hasOwnProperty.call(result, 'shipmentLastUpdatedAt'), false);
 });
 
+test('mapOrderDoc stores fulfilled only when the upstream value is boolean', () => {
+  assert.equal(mapOrderDoc({ fulfilled: true }).orderFulfilled, true);
+  assert.equal(mapOrderDoc({ fulfilled: false }).orderFulfilled, false);
+  assert.equal(mapOrderDoc({ fulfilled: null }).orderFulfilled, null);
+  assert.equal(mapOrderDoc({}).orderFulfilled, null);
+  assert.equal(mapOrderDoc({ fulfilled: 'false' }).orderFulfilled, null);
+});
+
 test('buildShipmentEnrichment exposes parseable shipment last_updated as source timestamp', () => {
   const now = new Date('2026-04-26T22:15:00.000Z');
   const result = buildShipmentEnrichment(

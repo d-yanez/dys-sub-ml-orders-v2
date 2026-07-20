@@ -38,6 +38,7 @@ function mapOrderDoc(mlOrder) {
     paymentId: payments[0] ? payments[0].id : null,
     shippingId: shipping.id || null,
     orderStatus: mlOrder.status || null,
+    orderFulfilled: typeof mlOrder.fulfilled === 'boolean' ? mlOrder.fulfilled : null,
     statusDetail: mlOrder.status_detail || mlOrder.statusDetail || null,
     tags: Array.isArray(mlOrder.tags) ? mlOrder.tags : [],
     orderItems: mappedOrderItems
