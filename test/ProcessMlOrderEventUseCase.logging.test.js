@@ -4,8 +4,9 @@ const Module = require('node:module');
 
 const useCasePath = require.resolve('../src/useCases/ProcessMlOrderEventUseCase');
 
-async function runProcessFlow({ shipmentPayload, enrichmentResult }) {
+async function runProcessFlow({ shipmentPayload, enrichmentResult, fulfilled = null }) {
   const records = [];
+  const persistedOrders = [];
   const originalLoad = Module._load;
 
   Module._load = function patchedLoad(request, parent, isMain) {
@@ -39,6 +40,7 @@ async function runProcessFlow({ shipmentPayload, enrichmentResult }) {
     if (request === '../repositories/eventOrderLogsRepository') {
       return {
         registerOrderProcessing: async () => ({ inserted: true, selector: { orderId: '2000017470612098' } }),
+        isOrderEventRegistered: async () => false,
         appendOrderPhase: async () => {},
         updateOrderEventStatus: async () => {},
         claimTelegramSend: async () => true,
@@ -47,11 +49,14 @@ async function runProcessFlow({ shipmentPayload, enrichmentResult }) {
       };
     }
     if (request === '../repositories/leaseLock') {
-      return { acquireLease: async () => ({ acquired: true, lock: { leaseUntil: new Date('2026-04-26T22:20:00.000Z') } }) };
+      return {
+        acquireLease: async () => ({ acquired: true, lock: { leaseUntil: new Date('2026-04-26T22:20:00.000Z') } }),
+        releaseLease: async () => {}
+      };
     }
     if (request === '../repositories/orderRepository') {
       return {
-        upsertOrderDocument: async () => {},
+        upsertOrderDocument: async (order) => persistedOrders.push(order),
         updateOrderEnrichment: async () => enrichmentResult
       };
     }
@@ -65,6 +70,7 @@ async function runProcessFlow({ shipmentPayload, enrichmentResult }) {
             pack_id: null,
             status: 'paid',
             status_detail: 'accredited',
+            fulfilled,
             tags: ['paid'],
             shipping: { id: 'ship-123' },
             payments: [],
@@ -93,9 +99,9 @@ async function runProcessFlow({ shipmentPayload, enrichmentResult }) {
   try {
     delete require.cache[useCasePath];
     const ProcessMlOrderEventUseCase = require('../src/useCases/ProcessMlOrderEventUseCase');
-    const payload = Buffer.from(JSON.stringify({ resource: '/orders/2000017470612098' })).toString('base64');
+    const payload = Buffer.from(JSON.stringify({ _id: 'event-1', resource: '/orders/2000017470612098' })).toString('base64');
     const result = await ProcessMlOrderEventUseCase.execute({ message: { data: payload, attributes: { traceId: 'trace-log-test' }, messageId: 'msg-1' } });
-    return { result, records };
+    return { result, records, persistedOrders };
   } finally {
     Module._load = originalLoad;
     delete require.cache[useCasePath];
@@ -111,6 +117,18 @@ test('ProcessMlOrderEventUseCase logs timestamp-missing shipment enrichment bran
   assert.equal(result.ackStatus, 204);
   assert.equal(records.some((record) => record.event === 'shipment_enrichment_timestamp_missing' && record.level === 'warn'), true);
   assert.equal(records.some((record) => record.event === 'shipment_enrichment_stale_skipped'), false);
+});
+
+test('ProcessMlOrderEventUseCase persists fulfilled from the refreshed ML order', async () => {
+  const { result, persistedOrders } = await runProcessFlow({
+    fulfilled: true,
+    shipmentPayload: {},
+    enrichmentResult: { matchedCount: 1, modifiedCount: 1, staleSkipped: false }
+  });
+
+  assert.equal(result.ackStatus, 204);
+  assert.equal(persistedOrders.length, 1);
+  assert.equal(persistedOrders[0].orderFulfilled, true);
 });
 
 test('ProcessMlOrderEventUseCase logs stale-skipped shipment enrichment branch', async () => {
