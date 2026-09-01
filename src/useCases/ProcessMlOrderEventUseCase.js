@@ -4,13 +4,14 @@ const { createLogContext, updateLogContext, createLogger } = require('../infrast
 const { sendTelegramNotification } = require('../infrastructure/telegramClient');
 const {
   registerOrderProcessing,
+  isOrderEventRegistered,
   appendOrderPhase,
   updateOrderEventStatus,
   claimTelegramSend,
   markTelegramSent,
   clearTelegramClaim
 } = require('../repositories/eventOrderLogsRepository');
-const { acquireLease } = require('../repositories/leaseLock');
+const { acquireLease, releaseLease } = require('../repositories/leaseLock');
 const { upsertOrderDocument, updateOrderEnrichment } = require('../repositories/orderRepository');
 const { getMlOrder, getMlItem, getMlShipment } = require('../services/mlService');
 const { getStockBySku, getStockCircuitSnapshot } = require('../services/stockService');
@@ -181,6 +182,21 @@ class ProcessMlOrderEventUseCase {
     updateLogContext(ctx, { orderId });
 
     const lockOwner = uuidv4();
+    const releaseAndReturn = async (result) => {
+      try {
+        await releaseLease({ key: String(orderId), owner: lockOwner });
+      } catch (error) {
+        log.error({
+          event: 'lock_release_failed',
+          phase: 'idempotency',
+          status: 'ERROR',
+          errorCode: ERROR_CODES.MONGO_WRITE_FAILED,
+          errorSummary: 'Lease release failed',
+          errorDetails: error.message
+        });
+      }
+      return result;
+    };
 
     log.info({
       event: 'phase_received_event',
@@ -228,16 +244,25 @@ class ProcessMlOrderEventUseCase {
     }
 
     if (!lockLease.acquired) {
+      let duplicate = false;
+      try {
+        duplicate = await isOrderEventRegistered({ payload, messageId });
+      } catch (error) {
+        log.error({ event: 'lock_busy_event_lookup_failed', phase: 'idempotency', status: 'ERROR', errorDetails: error.message });
+        return { ackStatus: 500, traceId, orderId };
+      }
       log.debug({
         event: 'lock_busy',
         phase: 'idempotency',
-        status: 'SUCCESS',
+        status: duplicate ? 'SUCCESS' : 'RETRYABLE',
         idempotencyKey: String(orderId),
         idempotencySource: 'orderId',
         lockOwner,
         lockLeaseUntil: lockLease.lock && lockLease.lock.leaseUntil ? lockLease.lock.leaseUntil : null
       });
-      return { ackStatus: 204, traceId, orderId, duplicate: true };
+      return duplicate
+        ? { ackStatus: 204, traceId, orderId, duplicate: true }
+        : { ackStatus: 500, traceId, orderId, retryable: true };
     }
 
     log.debug({
@@ -275,7 +300,7 @@ class ProcessMlOrderEventUseCase {
           status: 'SUCCESS'
         });
 
-        return { ackStatus: 204, traceId, orderId, duplicate: true };
+        return releaseAndReturn({ ackStatus: 204, traceId, orderId, duplicate: true });
       }
 
       log.debug({
@@ -303,7 +328,7 @@ class ProcessMlOrderEventUseCase {
         errorDetails: classified.errorDetails
       });
 
-      return { ackStatus: 500, traceId, orderId };
+      return releaseAndReturn({ ackStatus: 500, traceId, orderId });
     }
 
     let mappedOrder = null;
@@ -775,11 +800,11 @@ class ProcessMlOrderEventUseCase {
         ackStatus: classifiedError.ackStatus
       });
 
-      return {
+      return releaseAndReturn({
         ackStatus: classifiedError.ackStatus,
         traceId,
         orderId
-      };
+      });
     }
 
     timings.elapsed_ms_total = Date.now() - processStart;
@@ -877,12 +902,12 @@ class ProcessMlOrderEventUseCase {
       });
     }
 
-    return {
+    return releaseAndReturn({
       ackStatus: 204,
       traceId,
       orderId,
       warning
-    };
+    });
   }
 }
 

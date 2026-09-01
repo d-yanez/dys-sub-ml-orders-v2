@@ -8,6 +8,7 @@ let db = null;
 function getCollections() {
   return {
     eventOrderLogs: db.collection('eventOrderLogs'),
+    orderNotificationStates: db.collection('orderNotificationStates'),
     processingLocks: db.collection('processingLocks'),
     order: db.collection('order')
   };
@@ -25,7 +26,7 @@ async function dropIndexIfExists(collection, indexName) {
 }
 
 async function ensureIndexes() {
-  const { eventOrderLogs, processingLocks, order } = getCollections();
+  const { eventOrderLogs, orderNotificationStates, processingLocks, order } = getCollections();
   const ttlSeconds = Math.max(env.eventLogTtlDays, 1) * 24 * 60 * 60;
 
   await dropIndexIfExists(eventOrderLogs, 'ux_eventOrderLogs_orderId');
@@ -34,11 +35,12 @@ async function ensureIndexes() {
 
   await eventOrderLogs.createIndexes([
     {
-      key: { orderId: 1 },
+      key: { eventId: 1 },
       unique: true,
-      name: 'ux_eventOrderLogs_orderId',
-      partialFilterExpression: { orderId: { $type: 'string' } }
+      name: 'ux_eventOrderLogs_eventId',
+      partialFilterExpression: { eventId: { $type: 'string' } }
     },
+    { key: { orderId: 1 }, name: 'ix_eventOrderLogs_orderId' },
     { key: { traceId: 1 }, name: 'ix_eventOrderLogs_traceId' },
     { key: { messageId: 1 }, name: 'ix_eventOrderLogs_messageId' },
     { key: { createdAt: 1 }, expireAfterSeconds: ttlSeconds, name: 'ttl_eventOrderLogs_createdAt' }
@@ -51,6 +53,11 @@ async function ensureIndexes() {
       expireAfterSeconds: Math.max(env.processingLockTtlSeconds, 60),
       name: 'ttl_processingLocks_createdAt'
     }
+  ]);
+
+  await orderNotificationStates.createIndexes([
+    { key: { orderId: 1 }, unique: true, name: 'ux_orderNotificationStates_orderId' },
+    { key: { createdAt: 1 }, expireAfterSeconds: ttlSeconds, name: 'ttl_orderNotificationStates_createdAt' }
   ]);
 
   await order.createIndexes([
